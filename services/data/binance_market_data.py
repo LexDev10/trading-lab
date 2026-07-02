@@ -6,7 +6,7 @@
 # del documento de especificación.
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Literal
 
@@ -23,40 +23,72 @@ def _ms_to_dt(ms: int) -> datetime:
     return datetime.fromtimestamp(ms / 1000, tz=UTC)
 
 
+def _parse_klines_rows(asset: str, timeframe: Interval, raw: list) -> list[Candle]:
+    candles = []
+    for row in raw:
+        (
+            open_time_ms,
+            open_,
+            high,
+            low,
+            close,
+            volume,
+            close_time_ms,
+            quote_volume,
+            *_rest,
+        ) = row
+        candles.append(
+            Candle(
+                asset=asset,
+                timeframe=timeframe,
+                open_time=_ms_to_dt(open_time_ms),
+                close_time=_ms_to_dt(close_time_ms),
+                open=Decimal(str(open_)),
+                high=Decimal(str(high)),
+                low=Decimal(str(low)),
+                close=Decimal(str(close)),
+                volume=Decimal(str(volume)),
+                quote_volume=Decimal(str(quote_volume)),
+            )
+        )
+    return candles
+
+
 class BinanceMarketData:
     def __init__(self) -> None:
         self._client = Spot(base_url=MARKET_DATA_BASE_URL)
 
     def fetch_klines(self, asset: str, timeframe: Interval, limit: int = 500) -> list[Candle]:
         raw = self._client.klines(symbol=asset, interval=timeframe, limit=limit)
-        candles = []
-        for row in raw:
-            (
-                open_time_ms,
-                open_,
-                high,
-                low,
-                close,
-                volume,
-                close_time_ms,
-                quote_volume,
-                *_rest,
-            ) = row
-            candles.append(
-                Candle(
-                    asset=asset,
-                    timeframe=timeframe,
-                    open_time=_ms_to_dt(open_time_ms),
-                    close_time=_ms_to_dt(close_time_ms),
-                    open=Decimal(str(open_)),
-                    high=Decimal(str(high)),
-                    low=Decimal(str(low)),
-                    close=Decimal(str(close)),
-                    volume=Decimal(str(volume)),
-                    quote_volume=Decimal(str(quote_volume)),
-                )
+        return _parse_klines_rows(asset, timeframe, raw)
+
+    def fetch_klines_range(
+        self, asset: str, timeframe: Interval, start_time: datetime, end_time: datetime
+    ) -> list[Candle]:
+        """Descarga paginada (max 1000 velas/llamada de Binance) para
+        histórico de backtesting (sección 14: "2+ años de velas 1h/4h").
+        Solo lectura, mismo endpoint público que `fetch_klines`."""
+        all_candles: list[Candle] = []
+        cursor = start_time
+        while cursor < end_time:
+            raw = self._client.klines(
+                symbol=asset,
+                interval=timeframe,
+                startTime=int(cursor.timestamp() * 1000),
+                endTime=int(end_time.timestamp() * 1000),
+                limit=1000,
             )
-        return candles
+            if not raw:
+                break
+            candles = _parse_klines_rows(asset, timeframe, raw)
+            all_candles.extend(candles)
+            next_cursor = candles[-1].close_time + timedelta(milliseconds=1)
+            if next_cursor <= cursor:
+                break
+            cursor = next_cursor
+            if len(raw) < 1000:
+                break
+        return all_candles
 
     def symbol_exists(self, asset: str) -> bool:
         info = self._client.exchange_info(symbol=asset)

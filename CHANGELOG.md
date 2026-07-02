@@ -112,3 +112,65 @@ Registro cronológico de lo implementado en el proyecto. Formato:
     limpia: ETHUSDT, BTCUSDT, DOGEUSDT), todos con `trigger=manual`.
   - Sin cambios de código en esta ronda — es una verificación de
     regresión, no una implementación nueva.
+
+- **[2026-07-02 18:53]** Scanner automático + backtesting walk-forward +
+  killswitch probado (siguen bloqueados por credenciales: executor OCO,
+  paper ledger, reconciliación, Telegram):
+  - **Refactor sin duplicación**: extraída la lógica compartida de
+    `/analiza` a `services/scanner/scanner.py` (`evaluate_asset`,
+    `evaluate_regime`, `decide_final_action`, `run_scan_cycle`).
+    `scripts/analiza.py` ahora la reutiliza en vez de duplicarla.
+  - `app/scheduler.py`: el ciclo automático (`market_cycle_job`) ahora
+    encadena ingesta + `run_scan_cycle` (`trigger=scheduled`) sobre todo
+    `UNIVERSE`, leyendo los datos recién ingestados de DB (sin llamadas
+    extra a Binance salvo `exchangeInfo` cuando hay setup real).
+  - **Verificado con datos reales**: ciclo automático aprobó un setup
+    real sin intervención manual (`XRPUSDT`, `rr_net_of_fees≈1.91`,
+    `final_action=watchlist` con aviso de executor pendiente); los otros
+    9 activos del universo quedaron correctamente rechazados con motivos
+    variados. 10 `decision_logs` con `trigger=scheduled` confirmados por
+    `psql`.
+  - `scripts/halt.py` / `scripts/rearm.py`: halt/rearme manual del
+    killswitch (sección 9.2/15), persistido en `system_state`. `/health`
+    reporta el `system_state` real de DB en vez de un valor fijo.
+  - `tests/integration/test_killswitch.py` **(nuevo, contra Postgres
+    real)**: confirma que halt bloquea el risk engine y rearme lo
+    desbloquea, sin recuperación automática.
+  - `backtests/download_history.py`: descarga paginada de histórico
+    (Binance público) — 800 días (2024-04-23 → 2026-07-02), 19200 velas
+    1h + 4800 velas 4h por cada uno de los 10 pares del universo.
+  - **Bug corregido en `services/data/persistence.py`**: `upsert_candles`
+    fallaba con lotes grandes (`asyncpg.exceptions...: cannot exceed
+    32767` parámetros) al insertar 19200 filas de una vez; corregido con
+    batching de 2000 filas.
+  - `backtests/strategy_breakout.py` + `walk_forward.py`: señales
+    vectorizadas reutilizando `compute_breakout_frame` (refactor de
+    `services/technical/setups.py` para compartir la MISMA lógica entre
+    scanner en vivo y backtest). Walk-forward sin solape (in-sample 6m /
+    out-of-sample 2m), grid search de `RANGE_LOOKBACK_CANDLES` ×
+    `VOLUME_CONFIRM_MULT` por ventana in-sample.
+  - **Bug metodológico encontrado y corregido**: la primera versión del
+    walk-forward reportaba un retorno compuesto de **+408.198%** —
+    vectorbt da el retorno del INSTRUMENTO (asumiendo ~100% del capital),
+    no del equity real gestionado con `RISK_PER_TRADE=0.5%`. Corregido
+    reescalando cada trade a `equity_impact = return_instrumento ×
+    (RISK_PER_TRADE / sl_pct_del_trade)`; el retorno baja a un +183.5%
+    (todavía optimista por la simplificación de curva secuencial, pero
+    ya no fantasioso).
+  - `backtests/RESULTS.md`: resultados reales — 60 folds walk-forward,
+    322 trades out-of-sample, win rate 55.6%, expectancy **positiva**
+    (+0.327% de equity/trade neto de fees), profit factor 2.45, max
+    drawdown −8.87% (bajo el killswitch del 10%). Comparado contra
+    buy&hold BTC (−7.68% mismo periodo) y contra 0%. Limitaciones
+    documentadas explícitamente (histórico corto, curva secuencial no
+    multi-posición, slippage aproximado, timeframes testeados por
+    separado, universo pequeño y correlacionado).
+  - `tests/unit/test_backtest_regression.py` **(nuevo)**: fixture fijo de
+    velas → entrada/SL/TP/trade/retorno EXACTOS conocidos (protege contra
+    divergencia silenciosa entre `services/technical/` y `backtests/`).
+  - 48/48 tests unitarios + 1/1 test de integración en verde, `mypy
+    --strict` sin errores en `core/` y `services/risk/`.
+  - `README.md` y `docs/PHASE_1_REPORT.md` actualizados con todo lo
+    anterior; sigue documentado como bloqueante real para cerrar Fase 1
+    la falta de `BINANCE_API_KEY`/`SECRET` de testnet y
+    `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`.

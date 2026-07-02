@@ -4,40 +4,39 @@ Uso:
     python -m scripts.analiza SOLUSDT              # modo informe (nunca ejecuta)
     python -m scripts.analiza SOLUSDT operar        # modo operar (respeta risk engine)
 
-Ambos modos corren el pipeline completo (scanner + técnico + risk engine).
+Ambos modos corren el pipeline completo (scanner + técnico + risk engine),
+vía `services.scanner.scanner.evaluate_asset` — la MISMA función que usa el
+ciclo automático (`run_scan_cycle`), para no duplicar lógica de señales
+(regla crítica, sección 6). Aquí solo vive lo específico del modo manual:
+descarga on-demand fuera del universo (sección 21.3), límite de tasa y
+rechazo de stablecoins (sección 21.5).
+
 El modo informe SIEMPRE registra `final_action=watchlist` y nunca ejecuta.
-El modo operar únicamente registra `final_action=enter` si el risk engine
-aprueba Y el executor está implementado — en este build (fase 1 en curso,
-sin `binance_executor.py` todavía) nunca se envía ninguna orden real; se
-dice explícitamente en el informe.
+El modo operar únicamente registraría `final_action=enter` si el risk
+engine aprueba Y el executor está implementado — en este build (fase 1 en
+curso, sin `binance_executor.py` todavía) nunca se envía ninguna orden
+real; se dice explícitamente en el informe.
 """
 
 import argparse
 import asyncio
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
 
 from sqlalchemy import func, select
 
 from app.config import Settings, get_settings
-from core.enums import FinalAction, RejectionReason, Trigger
+from core.enums import Trigger
 from core.git_info import get_git_sha
 from core.schemas.decision import DecisionRecord
-from db.models import DecisionLog, RegimeLog
+from db.models import DecisionLog
 from db.session import get_session
 from journal.decision_logger import log_decision
 from services.data.binance_market_data import BinanceMarketData
 from services.data.persistence import upsert_asset, upsert_candles
-from services.risk.engine import RiskInput, evaluate_risk
-from services.risk.portfolio_state import build_portfolio_snapshot
-from services.scanner.filters import run_hard_filters
-from services.scanner.regime import blocks_new_entries, compute_btc_regime
+from services.scanner.scanner import BTC_ASSET, decide_final_action, evaluate_asset, evaluate_regime
 from services.technical.indicators import candles_to_frame
-from services.technical.setups import detect_range_breakout
-from services.technical.signal_builder import build_technical_signal
 
 STABLECOIN_BASES = {"USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "USDP"}
-BTC_ASSET = "BTCUSDT"
 
 
 async def _check_manual_rate_limit(session, settings: Settings, now: datetime) -> bool:
@@ -48,12 +47,6 @@ async def _check_manual_rate_limit(session, settings: Settings, now: datetime) -
     result = await session.execute(stmt)
     count = result.scalar_one()
     return count < settings.manual_max_per_hour
-
-
-def _jsonable_breakout(detection: dict | None) -> dict | None:
-    if detection is None:
-        return None
-    return {**detection, "open_time": str(detection["open_time"]), "close_time": str(detection["close_time"])}
 
 
 def _print_header(asset: str, trigger_mode: str) -> None:
@@ -122,100 +115,49 @@ async def analiza(asset: str, operar: bool) -> None:
 
         # --- Régimen BTC (sección 8.3) ---
         btc_4h_df = candles_to_frame(btc_4h, now=now)
-        regime, regime_details = compute_btc_regime(btc_4h_df)
-        session.add(
-            RegimeLog(
-                ts=now,
-                btc_regime=regime.value,
-                atr_pct=Decimal(str(regime_details.get("atr_pct", 0))),
-                details_jsonb=regime_details,
-            )
-        )
-        regime_blocks = blocks_new_entries(regime)
+        regime, regime_details, regime_blocks = await evaluate_regime(session, btc_4h_df, now)
 
         print(f"\nRégimen BTC (4h): {regime.value}  {'[BLOQUEA ENTRADAS]' if regime_blocks else ''}")
         for k, v in regime_details.items():
             print(f"  - {k}: {v}")
 
-        # --- Filtros duros (sección 8.2) ---
+        # --- Pipeline compartido: filtros duros + técnico + risk engine ---
         asset_1h_df = candles_to_frame(asset_1h, now=now)
         asset_4h_df = candles_to_frame(asset_4h, now=now)
 
-        breakout_1h = detect_range_breakout(
-            asset_1h_df, settings.range_lookback_candles, float(settings.volume_confirm_mult)
-        )
-        breakout_4h = detect_range_breakout(
-            asset_4h_df, settings.range_lookback_candles, float(settings.volume_confirm_mult)
-        )
-        breakout_detected = breakout_1h is not None or breakout_4h is not None
-
-        latest_open_time = asset_1h_df["open_time"].iloc[-1] if len(asset_1h_df) else now
-        hard_filters = run_hard_filters(
-            latest_candle_open_time=latest_open_time,
-            timeframe="1h",
-            now=now,
-            quote_vol_24h=snapshot.quote_vol_24h,
-            spread_bps=snapshot.spread_bps,
-            change_24h_pct=snapshot.change_24h_pct,
-            breakout_detected=breakout_detected,
+        evaluation = await evaluate_asset(
+            session=session,
+            client=client,
+            asset=asset,
+            asset_1h_df=asset_1h_df,
+            asset_4h_df=asset_4h_df,
+            snapshot=snapshot,
+            regime=regime,
+            regime_blocks=regime_blocks,
             settings=settings,
+            now=now,
         )
 
         print("\nFiltros duros del scanner:")
-        for name, passed in hard_filters.checks.items():
+        for name, passed in evaluation.scanner_payload["checks"].items():
             print(f"  [{'OK' if passed else 'FALLA'}] {name}")
 
-        scanner_payload = {
-            "checks": hard_filters.checks,
-            "quote_vol_24h": str(snapshot.quote_vol_24h),
-            "spread_bps": str(snapshot.spread_bps),
-            "change_24h_pct": str(snapshot.change_24h_pct),
-            "breakout_1h": _jsonable_breakout(breakout_1h),
-            "breakout_4h": _jsonable_breakout(breakout_4h),
-        }
+        technical_signal = evaluation.technical_signal
+        risk_verdict = evaluation.risk_verdict
 
-        technical_signal = None
-        risk_verdict = None
-        rejection_reasons: list[RejectionReason] = list(hard_filters.rejection_reasons)
+        if technical_signal is None:
+            print("\nNo se detectó ningún setup de ruptura de rango confirmado por volumen"
+                  " (o los filtros duros no pasaron).")
+        else:
+            print(f"\nSetup técnico detectado: {technical_signal.setup_type} "
+                  f"({technical_signal.timeframe}, conviction={technical_signal.conviction.value})")
+            print(f"  entry_zone: {technical_signal.entry_zone}")
+            print(f"  stop_loss: {technical_signal.stop_loss}")
+            print(f"  take_profit: {technical_signal.take_profit}")
+            print(f"  atr_14: {technical_signal.atr_14}")
+            print(f"  rel_volume: {technical_signal.rel_volume}")
 
-        if hard_filters.passed:
-            # 4h primero (más relevante para swing corto), luego 1h.
-            technical_signal = build_technical_signal(
-                asset, "4h", asset_4h_df, regime, settings, now
-            ) or build_technical_signal(asset, "1h", asset_1h_df, regime, settings, now)
-
-            if technical_signal is None:
-                rejection_reasons.append(RejectionReason.no_setup)
-                print("\nNo se detectó ningún setup de ruptura de rango confirmado por volumen.")
-            else:
-                print(f"\nSetup técnico detectado: {technical_signal.setup_type} "
-                      f"({technical_signal.timeframe}, conviction={technical_signal.conviction.value})")
-                print(f"  entry_zone: {technical_signal.entry_zone}")
-                print(f"  stop_loss: {technical_signal.stop_loss}")
-                print(f"  take_profit: {technical_signal.take_profit}")
-                print(f"  atr_14: {technical_signal.atr_14}")
-                print(f"  rel_volume: {technical_signal.rel_volume}")
-
-                entry_ref = (technical_signal.entry_zone[0] + technical_signal.entry_zone[1]) / Decimal("2")
-                min_notional = await asyncio.to_thread(client.get_min_notional, asset)
-                portfolio = await build_portfolio_snapshot(session, settings, asset, now)
-
-                risk_verdict = evaluate_risk(
-                    RiskInput(
-                        asset=asset,
-                        entry=entry_ref,
-                        stop_loss=technical_signal.stop_loss,
-                        take_profit=technical_signal.take_profit,
-                        atr_14=technical_signal.atr_14,
-                        spread_bps=snapshot.spread_bps,
-                        min_notional=min_notional,
-                        regime_blocks_entries=regime_blocks,
-                    ),
-                    portfolio,
-                    settings,
-                )
-                rejection_reasons.extend(risk_verdict.rejection_reasons)
-
+            if risk_verdict is not None:
                 print("\nRisk engine — checklist completo:")
                 for name, passed in risk_verdict.checks.items():
                     print(f"  [{'OK' if passed else 'FALLA'}] {name}")
@@ -224,15 +166,9 @@ async def analiza(asset: str, operar: bool) -> None:
                 print(f"  size_quote={risk_verdict.size_quote}")
 
         # --- Decisión final ---
-        if not operar:
-            final_action = FinalAction.watchlist
-        elif technical_signal is None or risk_verdict is None or not risk_verdict.approved:
-            final_action = FinalAction.reject
-        else:
-            # DECISION: el executor (OCO en testnet, sección 10) todavía no
-            # está implementado en este build. Fail-closed: no se envía
-            # ninguna orden aunque el risk engine apruebe.
-            final_action = FinalAction.watchlist
+        mode = "operate" if operar else "informe"
+        final_action, would_enter_no_executor = decide_final_action(mode, technical_signal, risk_verdict)
+        if would_enter_no_executor:
             print(
                 "\n>>> El risk engine APRUEBA esta operación, pero el executor "
                 "(binance_executor.py) todavía no está implementado en este "
@@ -245,13 +181,11 @@ async def analiza(asset: str, operar: bool) -> None:
             trigger=Trigger.manual,
             asset=asset,
             git_sha=get_git_sha(),
-            scanner=scanner_payload,
+            scanner=evaluation.scanner_payload,
             technical=technical_signal.model_dump(mode="json") if technical_signal else None,
-            fundamental=None,
-            decision=None,
             risk_verdict=risk_verdict.model_dump(mode="json") if risk_verdict else None,
             final_action=final_action,
-            rejection_reasons=rejection_reasons,
+            rejection_reasons=evaluation.rejection_reasons,
             expected_tp=technical_signal.take_profit if technical_signal else None,
             expected_sl=technical_signal.stop_loss if technical_signal else None,
             horizon_class=technical_signal.horizon_class if technical_signal else None,
@@ -260,7 +194,7 @@ async def analiza(asset: str, operar: bool) -> None:
         await session.commit()
 
         print(f"\nfinal_action: {final_action.value}")
-        print(f"rejection_reasons: {[r.value for r in rejection_reasons]}")
+        print(f"rejection_reasons: {[r.value for r in evaluation.rejection_reasons]}")
         print(f"decision_log_id: {decision_log_id}")
         print("=" * 60)
 
