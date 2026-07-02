@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     min_quote_vol_24h: Decimal = Decimal("50000000")
     max_spread_bps: Decimal = Decimal("5")
     min_abs_change_pct: Decimal = Decimal("3.0")
+    range_lookback_candles: int = 20
+    volume_confirm_mult: Decimal = Decimal("1.5")
+    paper_starting_equity_usdt: Decimal = Decimal("10000")
 
     # --- Risk engine ---
     risk_per_trade: Decimal = Decimal("0.005")

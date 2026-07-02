@@ -14,12 +14,15 @@ dependencies = [
     "alembic>=1.14,<2.0",
     "structlog>=24.4,<25.0",
     "binance-connector>=3.11,<4.0",
+    "pandas>=2.2,<3.0",
+    "numpy>=1.26,<3.0",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=8.3,<9.0",
     "pytest-asyncio>=0.24,<1.0",
+    "mypy>=1.13,<2.0",
 ]
 
 [tool.pytest.ini_options]

@@ -1,6 +1,5 @@
 """FastAPI: /health (dashboard llega en fase 3)."""
 
-import subprocess
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
@@ -9,27 +8,19 @@ from sqlalchemy import select
 
 from app.config import get_settings
 from app.scheduler import start_scheduler
+from core.git_info import get_git_sha
 from core.logging import configure_logging, get_logger
-from db.models import Candle
+from db.models import Candle, SystemState
 from db.session import get_session
 
 logger = get_logger("app")
-
-
-def _git_sha() -> str:
-    try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL
-        ).decode().strip()
-    except Exception:
-        return "unknown"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
     scheduler = start_scheduler()
-    logger.info("app.startup", git_sha=_git_sha())
+    logger.info("app.startup", git_sha=get_git_sha())
     yield
     scheduler.shutdown(wait=False)
     logger.info("app.shutdown")
@@ -43,10 +34,15 @@ async def health() -> dict:
     settings = get_settings()
     db_ok = True
     latest_candle_at = None
+    system_state = "running"
     try:
         async with get_session() as session:
             result = await session.execute(select(Candle.open_time).order_by(Candle.open_time.desc()).limit(1))
             latest_candle_at = result.scalar_one_or_none()
+            state_row = await session.execute(select(SystemState.state).where(SystemState.id == 1))
+            state_value = state_row.scalar_one_or_none()
+            if state_value is not None:
+                system_state = state_value
     except Exception:
         db_ok = False
 
@@ -62,6 +58,6 @@ async def health() -> dict:
         "latest_candle_at": latest_candle_at,
         "mode": settings.mode,
         "environment": settings.environment,
-        "system_state": "running",  # halt/killswitch llega con el risk engine (fase 1)
-        "git_sha": _git_sha(),
+        "system_state": system_state,
+        "git_sha": get_git_sha(),
     }

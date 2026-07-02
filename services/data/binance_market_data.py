@@ -58,6 +58,27 @@ class BinanceMarketData:
             )
         return candles
 
+    def symbol_exists(self, asset: str) -> bool:
+        info = self._client.exchange_info(symbol=asset)
+        return len(info.get("symbols", [])) > 0
+
+    def get_min_notional(self, asset: str) -> Decimal:
+        """Lee `exchangeInfo` (solo lectura, sin auth) para el filtro
+        NOTIONAL/MIN_NOTIONAL del símbolo. Usado por el risk engine
+        (`notional_min`, sección 9.1) y, en fase de ejecución, por
+        `binance_executor.py` (sección 10.1) — misma función, sin duplicar.
+        """
+        info = self._client.exchange_info(symbol=asset)
+        symbols = info.get("symbols", [])
+        if not symbols:
+            raise ValueError(f"symbol not found in exchangeInfo: {asset}")
+        for f in symbols[0].get("filters", []):
+            if f.get("filterType") in ("NOTIONAL", "MIN_NOTIONAL"):
+                value = f.get("minNotional") or f.get("notional")
+                if value is not None:
+                    return Decimal(str(value))
+        raise ValueError(f"no NOTIONAL filter found for {asset}")
+
     def fetch_ticker_24h(self, assets: list[str]) -> list[MarketSnapshot]:
         raw = self._client.ticker_24hr(symbols=assets)
         now = datetime.now(tz=UTC)

@@ -5,7 +5,7 @@ Regla del documento: precios y cantidades siempre Decimal, nunca float.
 """
 
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import AwareDatetime, BaseModel
 
@@ -33,4 +33,4 @@ class MarketSnapshot(BaseModel):
     spread_bps: Decimal
     quote_vol_24h: Decimal
     change_24h_pct: Decimal
-    raw: dict
+    raw: dict[str, Any]

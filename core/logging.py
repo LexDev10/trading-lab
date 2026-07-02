@@ -4,6 +4,7 @@ correlación cuando exista (a partir de fase 1)."""
 
 import logging
 import sys
+from typing import cast
 
 import structlog
 
@@ -27,5 +28,5 @@ def configure_logging(level: int = logging.INFO) -> None:
     )
 
 
-def get_logger(name: str) -> structlog.stdlib.BoundLogger:
-    return structlog.get_logger(name)
+def get_logger(name: str) -> structlog.typing.FilteringBoundLogger:
+    return cast(structlog.typing.FilteringBoundLogger, structlog.get_logger(name))

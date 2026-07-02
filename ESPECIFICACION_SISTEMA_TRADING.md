@@ -215,7 +215,17 @@ class RejectionReason(str, Enum):
     regime_filter, liquidity, spread, rr_too_low, max_positions,
     correlated_exposure, daily_loss_limit, drawdown_killswitch,
     cooldown, contract_violation, fundamental_veto, exchange_filter,
-    stale_data, execution_error
+    stale_data, execution_error, no_setup, sl_distance_invalid
+    # DECISION (fase 1, implementación): añadido `no_setup` — el filtro duro
+    # de "movimiento" (sección 8.2.4) no tenía motivo de rechazo asociado en
+    # la lista original. Se usa cuando el activo pasa liquidez/spread/frescura
+    # pero no hay ni cambio 24h suficiente ni ruptura de rango detectada, para
+    # cumplir el principio 5 ("todo se registra, incluidas las no-operaciones").
+    # DECISION (fase 1, implementación): añadido `sl_distance_invalid` — los
+    # checks `sl_distance_min`/`sl_distance_max` (sección 9.1) no tenían
+    # motivo de rechazo propio en la lista original. El check `notional_min`
+    # reutiliza `exchange_filter` (mismo motivo que usa la sección 10.1 para
+    # rechazos por filtros del exchange tras redondeo).
 class TradeStatus(str, Enum): pending, open, closed_tp, closed_sl, closed_manual, closed_invalidated, closed_time, error
 ```
 
@@ -594,6 +604,19 @@ OLLAMA_MODEL=qwen2.5:7b
 LIVE_MAX_CAPITAL=0             # debe fijarlo el usuario explícitamente
 TELEGRAM_BOT_TOKEN= / TELEGRAM_CHAT_ID=
 BINANCE_API_KEY= / BINANCE_API_SECRET=   # testnet y live separadas
+
+# DECISION (fase 1, implementación): parámetros no listados originalmente,
+# necesarios para el detector de ruptura de rango (sección 3.1/8.2.4). Se
+# calibran con datos reales de fase 1, como el resto de umbrales de la
+# sección 13.
+RANGE_LOOKBACK_CANDLES=20      # nº de velas previas que definen el rango roto
+VOLUME_CONFIRM_MULT=1.5        # rel_volume mínimo para confirmar ruptura
+
+# DECISION (fase 1, implementación): equity de arranque para el risk engine
+# mientras no exista ningún `equity_snapshots` real (antes del primer fill
+# en testnet). Una vez el paper_ledger persista snapshots reales de la
+# cuenta testnet (sección 10.1), estos los sustituyen por completo.
+PAPER_STARTING_EQUITY_USDT=10000
 ```
 
 ## Apéndice B — Qué NO hacer (resumen de trampas conocidas)
