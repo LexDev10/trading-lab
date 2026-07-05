@@ -2,7 +2,14 @@
 con sus datos cargados en memoria. Lo usan tanto el ciclo automático
 (`run_scan_cycle`, trigger=scheduled) como el comando manual
 `scripts/analiza.py` (trigger=manual) — MISMA función, sin duplicar lógica
-(regla crítica, sección 6)."""
+(regla crítica, sección 6).
+
+# DECISION (fase 1): cuando el risk engine aprueba (`would_enter_no_executor
+# =True`), el caller abre una posición de PAPEL vía
+# `services/execution/paper_ledger.py` (simulación sobre velas reales, sin
+# exchange) y registra `final_action=enter` — sustituto temporal del
+# executor OCO real contra testnet mientras no existan credenciales. Ver
+# el docstring de `paper_ledger.py` para el detalle completo."""
 
 import asyncio
 from dataclasses import dataclass, field
@@ -26,6 +33,7 @@ from db.models import RegimeLog
 from journal.decision_logger import log_decision
 from services.data.binance_market_data import BinanceMarketData
 from services.data.persistence import get_latest_snapshot, get_recent_candles
+from services.execution import paper_ledger
 from services.risk.engine import RiskInput, evaluate_risk
 from services.risk.portfolio_state import build_portfolio_snapshot
 from services.scanner.filters import run_hard_filters
@@ -45,6 +53,7 @@ class AssetEvaluation:
     technical_signal: TechnicalSignal | None
     risk_verdict: RiskVerdict | None
     rejection_reasons: list[RejectionReason] = field(default_factory=list)
+    entry_price: Decimal | None = None
 
 
 def _jsonable_breakout(detection: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -110,6 +119,7 @@ async def evaluate_asset(
 
     technical_signal: TechnicalSignal | None = None
     risk_verdict: RiskVerdict | None = None
+    entry_price: Decimal | None = None
     rejection_reasons: list[RejectionReason] = list(hard_filters.rejection_reasons)
 
     if hard_filters.passed:
@@ -122,6 +132,7 @@ async def evaluate_asset(
             rejection_reasons.append(RejectionReason.no_setup)
         else:
             entry_ref = (technical_signal.entry_zone[0] + technical_signal.entry_zone[1]) / Decimal("2")
+            entry_price = entry_ref
             min_notional = await asyncio.to_thread(client.get_min_notional, asset)
             portfolio = await build_portfolio_snapshot(session, settings, asset, now)
 
@@ -146,6 +157,7 @@ async def evaluate_asset(
         technical_signal=technical_signal,
         risk_verdict=risk_verdict,
         rejection_reasons=rejection_reasons,
+        entry_price=entry_price,
     )
 
 
@@ -172,8 +184,8 @@ async def run_scan_cycle(session: AsyncSession, settings: Settings, now: datetim
     (min_notional), que solo se pide cuando hay un setup real.
 
     Se comporta como el modo "operar" de `/analiza`: si el risk engine
-    aprueba, no hay executor todavía así que se registra `watchlist` con
-    aviso, nunca se inventa una ejecución."""
+    aprueba, se abre una posición de PAPEL (sin exchange real, ver
+    `services/execution/paper_ledger.py`) y se registra `final_action=enter`."""
     now = now or datetime.now(tz=UTC)
     client = BinanceMarketData()
     git_sha = get_git_sha()
@@ -227,8 +239,8 @@ async def run_scan_cycle(session: AsyncSession, settings: Settings, now: datetim
             "operate", evaluation.technical_signal, evaluation.risk_verdict
         )
         if would_enter_no_executor:
+            final_action = FinalAction.enter
             counts["enter_would"] += 1
-            log.info("cycle.would_enter_no_executor", asset=asset)
         elif final_action == FinalAction.reject:
             counts["reject"] += 1
         else:
@@ -250,7 +262,21 @@ async def run_scan_cycle(session: AsyncSession, settings: Settings, now: datetim
             expected_sl=technical_signal.stop_loss if technical_signal else None,
             horizon_class=technical_signal.horizon_class if technical_signal else None,
         )
-        await log_decision(session, record)
+        decision_log_id = await log_decision(session, record)
+
+        if would_enter_no_executor:
+            assert technical_signal is not None and evaluation.risk_verdict is not None and evaluation.entry_price is not None
+            await paper_ledger.open_position(
+                session,
+                settings,
+                decision_log_id=decision_log_id,
+                asset=asset,
+                technical_signal=technical_signal,
+                risk_verdict=evaluation.risk_verdict,
+                entry_price=evaluation.entry_price,
+                now=now,
+            )
+            log.info("cycle.paper_open", asset=asset, decision_log_id=decision_log_id)
 
     log.info("cycle.success", **counts)
     return counts

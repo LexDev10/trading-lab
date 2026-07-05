@@ -1,6 +1,12 @@
-"""APScheduler in-process. Un único job cada SCAN_INTERVAL_MINUTES que
-encadena ingesta de mercado + ciclo de scanner (sección 5: sin Celery, sin
-colas externas — swing corto no las necesita)."""
+"""APScheduler in-process (sección 5: sin Celery, sin colas externas —
+swing corto no las necesita). Tres jobs independientes, cada uno con su
+propio dominio de fallo:
+- `market_cycle_job`, cada `SCAN_INTERVAL_MINUTES`: ingesta + scan + paper
+  ledger (el core del sistema).
+- `fundamental_ingest_job`, misma cadencia: ingesta RSS/JSON al almacén
+  PIT (sección 12.2) — un fallo aquí no debe tumbar el ciclo técnico.
+- `daily_summary_job`, cron 22:00 UTC: resumen diario por Telegram
+  (sección 17)."""
 
 import asyncio
 from datetime import UTC, datetime
@@ -10,8 +16,12 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.config import get_settings
 from core.logging import get_logger
 from db.session import get_session
+from notifications.telegram import send_message
 from services.data.binance_market_data import BinanceMarketData
 from services.data.persistence import insert_market_snapshots, upsert_asset, upsert_candles
+from services.execution.paper_ledger import update_open_positions
+from services.fundamental.ingest_rss import ingest_all
+from services.reporting.daily_summary import build_daily_summary
 from services.scanner.scanner import run_scan_cycle
 
 logger = get_logger("scheduler")
@@ -51,11 +61,59 @@ async def _scan_cycle(now: datetime) -> None:
     log.info("job.success", **counts)
 
 
+async def _update_paper_positions(now: datetime) -> None:
+    settings = get_settings()
+    log = logger.bind(job="paper_positions", started_at=now.isoformat())
+    log.info("job.start")
+
+    async with get_session() as session:
+        counts = await update_open_positions(session, settings, now)
+        await session.commit()
+
+    log.info("job.success", **counts)
+
+
+async def _fundamental_ingest(now: datetime) -> None:
+    log = logger.bind(job="fundamental_ingest", started_at=now.isoformat())
+    log.info("job.start")
+
+    async with get_session() as session:
+        counts = await ingest_all(session, now)
+        await session.commit()
+
+    log.info("job.success", **counts)
+
+
+async def fundamental_ingest_job() -> None:
+    """Ingesta RSS/JSON al almacén PIT (sección 12.2), cada
+    `SCAN_INTERVAL_MINUTES` — job independiente de `market_cycle_job`: un
+    feed caído no debe afectar al escaneo técnico ni viceversa."""
+    started_at = datetime.now(tz=UTC)
+    try:
+        await _fundamental_ingest(started_at)
+    except Exception:
+        logger.exception("fundamental_ingest.failed")
+
+
+async def daily_summary_job() -> None:
+    """Resumen diario por Telegram a las 22:00 UTC (sección 17)."""
+    settings = get_settings()
+    now = datetime.now(tz=UTC)
+    try:
+        async with get_session() as session:
+            text = await build_daily_summary(session, settings, now)
+        await send_message(settings, text)
+    except Exception:
+        logger.exception("daily_summary.failed")
+
+
 async def market_cycle_job() -> None:
     """Ingesta velas 1h/4h y ticker 24h para todo el universo (idempotente,
-    un fallo a mitad de ciclo se corrige solo en el siguiente run) y, a
-    continuación, corre el scanner+técnico+risk engine (`trigger=scheduled`)
-    sobre datos ya frescos."""
+    un fallo a mitad de ciclo se corrige solo en el siguiente run), corre el
+    scanner+técnico+risk engine (`trigger=scheduled`) sobre datos ya frescos
+    y, por último, sigue las posiciones de papel abiertas (sección 11,
+    simplificado a esta misma cadencia — ver `services/execution/
+    paper_ledger.py`)."""
     started_at = datetime.now(tz=UTC)
     log = logger.bind(job="market_cycle", started_at=started_at.isoformat())
 
@@ -74,6 +132,12 @@ async def market_cycle_job() -> None:
         log.exception("scan.failed")
         return
 
+    try:
+        await _update_paper_positions(started_at)
+    except Exception:
+        log.exception("paper_positions.failed")
+        return
+
     duration_s = (datetime.now(tz=UTC) - started_at).total_seconds()
     log.info("cycle.complete", duration_s=duration_s)
 
@@ -87,6 +151,25 @@ def start_scheduler() -> AsyncIOScheduler:
         minutes=settings.scan_interval_minutes,
         id="market_cycle",
         next_run_time=datetime.now(tz=UTC),
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        fundamental_ingest_job,
+        trigger="interval",
+        minutes=settings.scan_interval_minutes,
+        id="fundamental_ingest",
+        next_run_time=datetime.now(tz=UTC),
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        daily_summary_job,
+        trigger="cron",
+        hour=22,
+        minute=0,
+        timezone=UTC,
+        id="daily_summary",
         max_instances=1,
         coalesce=True,
     )

@@ -12,10 +12,11 @@ descarga on-demand fuera del universo (sección 21.3), límite de tasa y
 rechazo de stablecoins (sección 21.5).
 
 El modo informe SIEMPRE registra `final_action=watchlist` y nunca ejecuta.
-El modo operar únicamente registraría `final_action=enter` si el risk
-engine aprueba Y el executor está implementado — en este build (fase 1 en
-curso, sin `binance_executor.py` todavía) nunca se envía ninguna orden
-real; se dice explícitamente en el informe.
+El modo operar registra `final_action=enter` si el risk engine aprueba,
+abriendo una posición de PAPEL (simulación sobre velas reales, sin
+exchange — ver `services/execution/paper_ledger.py`); nunca se envía
+ninguna orden real (el executor OCO contra testnet sigue bloqueado por
+credenciales).
 """
 
 import argparse
@@ -25,7 +26,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import func, select
 
 from app.config import Settings, get_settings
-from core.enums import Trigger
+from core.enums import FinalAction, Trigger
 from core.git_info import get_git_sha
 from core.schemas.decision import DecisionRecord
 from db.models import DecisionLog
@@ -33,6 +34,7 @@ from db.session import get_session
 from journal.decision_logger import log_decision
 from services.data.binance_market_data import BinanceMarketData
 from services.data.persistence import upsert_asset, upsert_candles
+from services.execution import paper_ledger
 from services.scanner.scanner import BTC_ASSET, decide_final_action, evaluate_asset, evaluate_regime
 from services.technical.indicators import candles_to_frame
 
@@ -169,11 +171,7 @@ async def analiza(asset: str, operar: bool) -> None:
         mode = "operate" if operar else "informe"
         final_action, would_enter_no_executor = decide_final_action(mode, technical_signal, risk_verdict)
         if would_enter_no_executor:
-            print(
-                "\n>>> El risk engine APRUEBA esta operación, pero el executor "
-                "(binance_executor.py) todavía no está implementado en este "
-                "build. No se ha enviado ninguna orden real. <<<"
-            )
+            final_action = FinalAction.enter
 
         record = DecisionRecord(
             ts=now,
@@ -191,6 +189,25 @@ async def analiza(asset: str, operar: bool) -> None:
             horizon_class=technical_signal.horizon_class if technical_signal else None,
         )
         decision_log_id = await log_decision(session, record)
+
+        if would_enter_no_executor:
+            assert technical_signal is not None and risk_verdict is not None and evaluation.entry_price is not None
+            await paper_ledger.open_position(
+                session,
+                settings,
+                decision_log_id=decision_log_id,
+                asset=asset,
+                technical_signal=technical_signal,
+                risk_verdict=risk_verdict,
+                entry_price=evaluation.entry_price,
+                now=now,
+            )
+            print(
+                "\n>>> El risk engine APRUEBA esta operación: se abre una "
+                "posición de PAPEL (simulación sobre velas reales, sin "
+                "exchange). No se ha enviado ninguna orden real. <<<"
+            )
+
         await session.commit()
 
         print(f"\nfinal_action: {final_action.value}")

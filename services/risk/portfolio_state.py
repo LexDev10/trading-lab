@@ -30,7 +30,11 @@ class PortfolioSnapshot:
     raw: dict[str, Any]
 
 
-async def _get_equity_quote(session: AsyncSession, settings: Settings) -> Decimal:
+async def get_latest_equity(session: AsyncSession, settings: Settings) -> Decimal:
+    """Última equity conocida (o el bootstrap `PAPER_STARTING_EQUITY_USDT`
+    si todavía no hay ningún `equity_snapshot`). Pública porque también la
+    usa `services/execution/paper_ledger.py` al cerrar una posición —
+    misma fuente de verdad que el risk engine, sin duplicar la query."""
     stmt = select(EquitySnapshot.equity_quote).order_by(EquitySnapshot.ts.desc()).limit(1)
     result = await session.execute(stmt)
     equity = result.scalar_one_or_none()
@@ -62,10 +66,14 @@ async def _get_daily_realized_pnl_pct(session: AsyncSession, equity: Decimal, no
     return pnl_quote / equity
 
 
-async def _get_drawdown_pct(session: AsyncSession) -> Decimal:
+async def _get_equity_peak(session: AsyncSession) -> Decimal | None:
     stmt = select(func.max(EquitySnapshot.equity_quote))
     result = await session.execute(stmt)
-    peak = result.scalar_one_or_none()
+    return result.scalar_one_or_none()
+
+
+async def _get_drawdown_pct(session: AsyncSession) -> Decimal:
+    peak = await _get_equity_peak(session)
     if peak is None or peak <= 0:
         return Decimal("0")
     current = await session.execute(
@@ -73,6 +81,19 @@ async def _get_drawdown_pct(session: AsyncSession) -> Decimal:
     )
     current_equity = current.scalar_one_or_none()
     if current_equity is None:
+        return Decimal("0")
+    return (peak - current_equity) / peak
+
+
+async def compute_drawdown_pct(session: AsyncSession, current_equity: Decimal) -> Decimal:
+    """Drawdown de `current_equity` frente al pico histórico ya persistido en
+    `equity_snapshots`. Pensado para quien va a INSERTAR la siguiente fila de
+    equity (p.ej. el paper ledger al cerrar una posición) y necesita el mismo
+    cálculo que `_get_drawdown_pct` sin duplicarlo ni esperar a que la fila
+    nueva exista todavía."""
+    peak = await _get_equity_peak(session)
+    peak = max(peak, current_equity) if peak is not None else current_equity
+    if peak <= 0:
         return Decimal("0")
     return (peak - current_equity) / peak
 
@@ -122,7 +143,7 @@ async def build_portfolio_snapshot(
 ) -> PortfolioSnapshot:
     now = now or datetime.now(tz=UTC)
 
-    equity = await _get_equity_quote(session, settings)
+    equity = await get_latest_equity(session, settings)
     open_positions, exposure_total = await _get_open_positions(session)
     daily_pnl_pct = await _get_daily_realized_pnl_pct(session, equity, now)
     drawdown_pct = await _get_drawdown_pct(session)

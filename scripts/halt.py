@@ -13,8 +13,10 @@ from datetime import UTC, datetime
 
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from app.config import get_settings
 from db.models import SystemState
 from db.session import get_session
+from notifications.telegram import send_message
 
 
 async def halt(reason: str) -> None:
@@ -31,6 +33,7 @@ async def halt(reason: str) -> None:
         await session.execute(stmt)
         await session.commit()
     print(f"Sistema en HALT. Motivo: {reason!r}. Rearme manual con: python -m scripts.rearm")
+    await send_message(get_settings(), f"🛑 <b>Sistema en HALT</b>\nMotivo: {reason}")
 
 
 if __name__ == "__main__":

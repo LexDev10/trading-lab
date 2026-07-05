@@ -7,7 +7,7 @@ trade_exits, position_events, equity_snapshots, system_state)."""
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, PrimaryKeyConstraint, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, PrimaryKeyConstraint, String, Text
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -94,6 +94,7 @@ class TradeEntry(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     decision_log_id: Mapped[int] = mapped_column(ForeignKey("decision_logs.id"))
+    asset: Mapped[str] = mapped_column(String(20))
     environment: Mapped[str] = mapped_column(String(10))
     client_order_id: Mapped[str] = mapped_column(String(64), unique=True)
     exchange_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -104,6 +105,9 @@ class TradeEntry(Base):
     sl: Mapped[Decimal] = mapped_column(NUMERIC)
     oco_list_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(20))
+    timeframe: Mapped[str | None] = mapped_column(String(2), nullable=True)
+    horizon_class: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    invalidation_level: Mapped[Decimal | None] = mapped_column(NUMERIC, nullable=True)
 
 
 class TradeExit(Base):
@@ -139,6 +143,26 @@ class EquitySnapshot(Base):
     equity_quote: Mapped[Decimal] = mapped_column(NUMERIC)
     open_positions: Mapped[int] = mapped_column(Integer)
     drawdown_pct: Mapped[Decimal] = mapped_column(NUMERIC)
+
+
+class NewsItem(Base):
+    """Almacén point-in-time inmutable (sección 12.1, fase 2). Append-only:
+    nunca se hace UPDATE sobre una fila; una reclasificación futura será
+    una fila nueva en `item_classifications` (todavía no existe — llega
+    con el clasificador)."""
+
+    __tablename__ = "news_items"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(40))
+    source_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    title: Mapped[str] = mapped_column(String(500))
+    body_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    asset_tags: Mapped[list[str]] = mapped_column(ARRAY(String), default=list)
+    published_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+    fetched_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
+    content_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    raw_jsonb: Mapped[dict] = mapped_column(JSONB)
 
 
 class SystemState(Base):

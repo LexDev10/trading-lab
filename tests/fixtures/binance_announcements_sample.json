@@ -1,0 +1,36 @@
+{
+  "code": "000000",
+  "message": null,
+  "messageDetail": null,
+  "data": {
+    "articles": [
+      {
+        "id": 1,
+        "code": "abc123",
+        "title": "Binance Will List Solana (SOL) on Innovation Zone",
+        "imageLink": null,
+        "shortLink": null,
+        "body": null,
+        "type": null,
+        "catalogId": null,
+        "catalogName": null,
+        "publishDate": null,
+        "footer": null
+      },
+      {
+        "id": 2,
+        "code": "def456",
+        "title": "Binance Futures Will Launch USDT-Margined XYZUSDT Perpetual Contract",
+        "imageLink": null,
+        "shortLink": null,
+        "body": null,
+        "type": null,
+        "catalogId": null,
+        "catalogName": null,
+        "publishDate": null,
+        "footer": null
+      }
+    ]
+  },
+  "success": true
+}

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+<channel>
+<title>Test Feed</title>
+<item>
+<title>Bitcoin ETF sees record inflows this week</title>
+<link>https://example.com/btc-etf</link>
+<guid>https://example.com/btc-etf</guid>
+<description>Bitcoin ETFs recorded their largest weekly inflow so far.</description>
+<pubDate>Wed, 01 Jul 2026 12:00:00 GMT</pubDate>
+</item>
+<item>
+<title>Random unrelated headline about weather</title>
+<link>https://example.com/weather</link>
+<guid>https://example.com/weather</guid>
+<description>Nothing crypto related here.</description>
+<pubDate>Wed, 01 Jul 2026 13:00:00 GMT</pubDate>
+</item>
+</channel>
+</rss>

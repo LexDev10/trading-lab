@@ -1,17 +1,26 @@
 # Fase 1 — Pipeline técnico + paper trading
 
-Estado: **en progreso, no cerrada**. Todo lo que se puede construir y
+Estado: **en progreso, no cerrada — pausada deliberadamente** (decisión
+del usuario, 2026-07-03: priorizar Telegram + arrancar fase 2 en vez de
+seguir esperando credenciales de testnet; ver
+[docs/PHASE_2_REPORT.md](PHASE_2_REPORT.md)). Lo único que falta para
+cerrarla (executor OCO real, reconciliación) sigue bloqueado por
+`BINANCE_API_KEY`/`SECRET` de testnet, no por trabajo pendiente. Todo lo
+que se puede construir y
 verificar honestamente SIN credenciales externas está hecho: contratos,
 indicadores, régimen, filtros duros, detección de setups, risk engine
-completo, journal, `/analiza` (CLI), **scanner automático enganchado al
-scheduler**, **backtesting walk-forward con resultados reales**, y
-**killswitch con halt/rearme manual probado por integración**.
+completo, journal, `/analiza` y `/estado` (CLI), **scanner automático
+enganchado al scheduler**, **backtesting walk-forward con resultados
+reales**, **killswitch con halt/rearme manual probado por integración**, y
+un **paper ledger interno** que abre/sigue/cierra posiciones simuladas
+sobre velas reales (sin exchange) cuando el risk engine aprueba — permite
+ver la rentabilidad forward de las señales sin ninguna credencial.
 
 **Bloqueante real para terminar de cerrar la fase** (no es trabajo
 pendiente de escribir código, es dependencia externa): el executor OCO
-contra Binance Spot Testnet, el paper ledger, la reconciliación y las
-alertas de Telegram necesitan credenciales que este proyecto no tiene
-todavía — `BINANCE_API_KEY`/`SECRET` de testnet y
+real contra Binance Spot Testnet, la reconciliación y las alertas de
+Telegram necesitan credenciales que este proyecto no tiene todavía —
+`BINANCE_API_KEY`/`SECRET` de testnet y
 `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`. Sin eso no hay manera honesta de
 verificar "una posición completa abre y cierra en testnet vía OCO" ni
 "alertas Telegram funcionan" (criterios de aceptación, sección 19), así
@@ -157,9 +166,23 @@ confirmados por `psql`. Descarga de 800 días de histórico (19200 velas
 éxito. Test de integración del killswitch verificado contra Postgres
 real.
 
+**Sesión 4** (esta, paper ledger interno): arranque limpio → migración
+`0003` aplica sin problemas → varios ciclos automáticos completos
+(ingesta → scan → paper positions) sin errores. `/analiza <PAR> operar`
+probado contra 9 de los 10 pares del universo (el décimo, `BNBUSDT`,
+topó con `MANUAL_MAX_PER_HOUR` — confirma que el rate limit sigue
+funcionando igual que antes); ningún setup real disponible en el momento
+de la verificación, así que el camino de apertura de posición de papel no
+se disparó por ese lado, pero sí quedó verificado exhaustivamente por
+integración (ver abajo): apertura + cierre directo con aserciones exactas
+sobre fees/pnl/equity, y `update_open_positions` cerrando una posición
+real al detectar TP en velas insertadas a mano. `/estado` verificado
+mostrando sistema, régimen, equity/drawdown, posiciones abiertas (0) y
+resumen de cerradas (0) correctamente.
+
 ## Tests
 
-**48 tests unitarios** en verde (sin DB, `docker compose run --rm
+**57 tests unitarios** en verde (sin DB, `docker compose run --rm
 --no-deps app uv run pytest -v`):
 
 - `test_indicators.py`, `test_regime.py`, `test_filters.py`,
@@ -175,14 +198,23 @@ real.
   conocidas"). Protege contra divergencia silenciosa entre
   `services/technical/` y `backtests/`.
 
-**1 test de integración** (necesita Postgres real, `docker compose exec
+- `test_paper_ledger.py` **(nuevo)**: `evaluate_exit` — SL, TP, SL gana a
+  TP en la misma vela (criterio conservador), invalidación técnica, sin
+  salida todavía, anti look-ahead (vela de la propia señal ignorada), y
+  salida por tiempo en sus dos variantes (`hours`/`days`).
+
+**3 tests de integración** (necesita Postgres real, `docker compose exec
 app uv run pytest tests/integration -v`):
 
-- `test_killswitch.py` **(nuevo)**: halt manual bloquea el risk engine,
-  rearme lo desbloquea, sin recuperación automática.
+- `test_killswitch.py`: halt manual bloquea el risk engine, rearme lo
+  desbloquea, sin recuperación automática.
+- `test_paper_ledger.py` **(nuevo)**: apertura + cierre de una posición de
+  papel con aserciones exactas de fees/pnl/equity contra
+  `services/risk/portfolio_state.py`; `update_open_positions` cerrando
+  una posición real al detectar TP en velas insertadas a mano.
 
-`mypy --strict` sobre `core/` y `services/risk/`: sin errores (13
-archivos), confirmado de nuevo tras todos los cambios de esta sesión.
+`mypy --strict` sobre `core/`, `services/risk/` y `services/execution/`
+(nuevo en el scope): sin errores (15 archivos).
 
 ## Decisiones de diseño documentadas (añadidas al documento de spec)
 
@@ -202,6 +234,8 @@ Todas marcadas `# DECISION` en el código y reflejadas en
    través de reinicios.
 6. Clasificación de `conviction` por umbral de `rel_volume` — regla
    conservadora explícita, calibrable con más datos (sección 13).
+7. Paper ledger interno (sección 10.1) — simulación pura sobre velas
+   reales en vez de fills de testnet, mientras no existan credenciales.
 
 ## Hallazgo relevante (confirmado, no resuelto — es una calibración, no un bug)
 
@@ -216,17 +250,20 @@ de calibración que la sección 13 reserva para datos de fase 1-2.
 
 ## Qué quedó fuera (bloqueado por credenciales)
 
-- `services/execution/binance_executor.py` (OCO en testnet, idempotencia,
-  fills parciales, rate limits) — sección 10. Necesita
-  `BINANCE_API_KEY`/`SECRET` de testnet.
-- `services/monitor/` (position_monitor, exit_rules) — sección 11.
-  Depende de que existan posiciones reales abiertas por el executor.
-- `services/execution/paper_ledger.py` y `equity_snapshots` reales (hoy
-  usa el bootstrap `PAPER_STARTING_EQUITY_USDT`). Depende del executor.
-- `notifications/telegram.py` y comando `/estado`. Necesita
-  `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`.
+- `services/execution/binance_executor.py` real (OCO en testnet,
+  idempotencia, fills parciales, rate limits) — sección 10. Necesita
+  `BINANCE_API_KEY`/`SECRET` de testnet. El paper ledger interno
+  (`services/execution/paper_ledger.py`) cubre la parte de "ver
+  rentabilidad" sin necesitar esto — ver `# DECISION` en la sección 10.1.
+- `services/monitor/` real contra órdenes de exchange (position_monitor,
+  exit_rules) — sección 11. El paper ledger ya cubre TP/SL/invalidación/
+  tiempo de forma simulada; lo que falta aquí es específico de vigilar
+  órdenes reales (estado de OCO, reconciliación de fills).
+- `notifications/telegram.py`. Necesita
+  `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`. `/estado` ya existe como
+  comando CLI (`scripts/estado.py`), independiente de Telegram.
 - Reconciliación (`services/execution/reconciler.py`). Depende del
-  executor y de las keys de testnet.
+  executor real y de las keys de testnet.
 
 ## Cómo reproducir la verificación
 
@@ -235,6 +272,7 @@ cp .env.example .env
 docker compose up -d --build
 docker compose exec app uv run python -m scripts.analiza SOLUSDT
 docker compose exec app uv run python -m scripts.analiza SOLUSDT operar
+docker compose exec app uv run python -m scripts.estado
 docker compose exec app uv run python -m scripts.halt "prueba"
 docker compose exec app uv run python -m scripts.rearm
 docker compose exec app uv run python -m backtests.download_history --days 800

@@ -29,4 +29,5 @@ class TechnicalSignal(BaseModel):
     rel_volume: Decimal
     horizon_class: HorizonClass
     invalidation_rule: str
+    invalidation_level: Decimal
     evidence: dict[str, Any]

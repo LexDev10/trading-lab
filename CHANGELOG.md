@@ -3,6 +3,176 @@
 Registro cronológico de lo implementado en el proyecto. Formato:
 `[YYYY-MM-DD HH:MM] Descripción`.
 
+## 2026-07-03
+
+- **[2026-07-03, segunda ronda]** **Alertas de Telegram** + **arranque de
+  Fase 2** (capa fundamental). Decisión del usuario: pausar el resto de
+  fase 1 (executor OCO real, bloqueado por credenciales de testnet) para
+  primero tener Telegram funcionando y luego arrancar fase 2, en vez de
+  saltar a fase 3 (que depende de fase 2 — el meta-decider fusiona
+  técnico × fundamental).
+  - `notifications/telegram.py` (nuevo): `send_message(settings, text)`
+    vía `httpx` contra la API HTTP de Telegram. **Fail-open** por diseño
+    (a diferencia del resto del sistema): una excepción de red se loguea
+    y no se propaga — un fallo de Telegram nunca debe tumbar un ciclo del
+    scheduler ni bloquear una decisión de trading. No-op si
+    `TELEGRAM_BOT_TOKEN`/`CHAT_ID` están vacíos.
+  - Cuatro disparadores conectados: nueva posición de papel y cierre con
+    PnL (`services/execution/paper_ledger.py::open_position/
+    close_position`, ganan parámetro `settings`), halt/rearme
+    (`scripts/halt.py`/`scripts/rearm.py`), y un resumen diario nuevo.
+  - `services/reporting/daily_summary.py` (nuevo): agrega equity/drawdown
+    (reutiliza `portfolio_state.build_portfolio_snapshot`), trades del día
+    (`trade_exits`), rechazos por motivo del día (`unnest` sobre
+    `decision_logs.rejection_reasons`) y estado de `CORE_ASSETS` aunque no
+    haya setup (sección 21.4) — reutiliza `services/scanner/
+    regime.py::compute_btc_regime` tal cual (ya es agnóstica al activo)
+    sobre las velas 4h ya ingeridas de cada core asset, sin escribir en
+    `regime_log` (esa tabla es específicamente el régimen de BTC que
+    consume el risk engine).
+  - `app/scheduler.py` gana dos jobs nuevos e independientes de
+    `market_cycle_job` (dominios de fallo separados): `fundamental_
+    ingest_job` (misma cadencia de 15 min) y `daily_summary_job` (cron
+    22:00 UTC).
+  - **Fase 2 — arranque**: `news_items` (migración `0004`, solo esta
+    tabla — `social_items`/`item_classifications`/`classifier_scorecard`
+    quedan fuera por ahora, sin consumidor todavía). `core/schemas/
+    fundamental.py::NewsItem`. `services/fundamental/ingest_rss.py`:
+    ingesta RSS (CoinDesk, The Block vía `feedparser`) + el endpoint JSON
+    no documentado de anuncios de Binance (sección 12.2), separando
+    fetch (red) de parseo (puro, testeable con fixtures) igual que
+    `services/data/binance_market_data.py`. `extract_asset_tags`:
+    heurística determinista de palabra completa contra alias conocidos
+    del universo — filtra relevancia por activo, NO es la clasificación
+    real (eso lo hará Ollama, todavía sin construir). Cada fuente falla
+    de forma independiente (`ingest_all`, fail-closed por fuente).
+  - **Explícitamente diferido** (ver `docs/PHASE_2_REPORT.md`): Reddit
+    (necesita registrar una app OAuth — credenciales que el proyecto no
+    tiene) y clasificador Ollama (necesita decidir conectividad:
+    docker-compose vs `host.docker.internal`, sin resolver).
+  - Nuevas dependencias `httpx`/`feedparser`, justificadas en README
+    (sección 20 regla 6). `mypy --strict` ampliado a `notifications/`,
+    `services/fundamental/`, `services/reporting/` — 22 archivos, sin
+    errores.
+  - 9 tests unitarios nuevos (`test_telegram.py`: no-op sin credenciales,
+    payload correcto, fail-open ante error de red; `test_ingest_rss.py`:
+    `extract_asset_tags` con casos límite de frontera de palabra,
+    `content_hash` determinista, parseo de RSS/JSON contra fixtures
+    grabadas) + 3 tests de integración nuevos (`test_ingest_rss.py`:
+    idempotencia de `persist_news_items`; `test_daily_summary.py`:
+    agregación de rechazos/trades — en deltas, no valores absolutos, ver
+    abajo). 66/66 unitarios + 5/5 integración en verde.
+  - **Tres bugs de test encontrados durante la verificación, los tres por
+    la misma causa raíz**: el scheduler en vivo llevaba corriendo toda la
+    sesión y de hecho **abrió una posición de papel real** (`ETHUSDT`) —
+    primera entrada real generada de forma 100% automática — **y más
+    tarde la cerró también sola** (`closed_sl`, pnl −6.6444 USDT,
+    confirmado con `scripts.estado`). Eso rompió tres tests que asumían
+    una DB "limpia" o fechas fijas en el pasado: (1) `test_killswitch.py`
+    afirmaba `verdict.approved is True` antes de halt, pero la exposición
+    real de esa posición hace que `correlated_exposure` legítimamente
+    falle — corregido para afirmar solo sobre `checks["system_not_halted"]`
+    (lo único que ese test ejercita) en vez del `approved` global. (2)
+    `test_daily_summary.py` afirmaba conteos/pnl absolutos
+    (`"liquidity: 2"`, `"50.0000"`) contra tablas que la app real sigue
+    escribiendo en paralelo — corregido para afirmar sobre el delta
+    introducido por los datos sembrados. (3) `test_paper_ledger.py`
+    (sesión anterior) anclaba sus timestamps a una fecha fija en el
+    pasado (2026-01-01): en cuanto existió una operación de papel REAL
+    con timestamp posterior, esa fecha dejó de ser "la última equity" y
+    las aserciones de equity empezaron a leer el dato real en vez del
+    propio del test — corregido anclando todos los timestamps del test a
+    `datetime.now(tz=UTC)` con offsets relativos (`+3h`), que por
+    construcción siempre quedan por delante de cualquier dato real
+    existente. Lección general: cualquier test de integración que escriba
+    en `equity_snapshots` (sin FK, "última fila por `ts`" global) debe
+    anclarse a `now()` real, nunca a una fecha fija — confirmado con una
+    segunda corrida repetida de la suite de integración tras el fix.
+  - Verificado end-to-end con el stack completo: migración `0004`
+    aplicada limpia; `fundamental_ingest_job` corrió en vivo contra las 3
+    fuentes reales (`news_items`: 25 CoinDesk + 20 The Block + 20 Binance
+    anuncios); halt y rearme reales confirmados recibidos en el Telegram
+    real del usuario.
+  - `# DECISION` nuevo en `ESPECIFICACION_SISTEMA_TRADING.md` sección
+    12.2 (alcance de este arranque + uso del endpoint no documentado de
+    Binance). `README.md` con secciones de Telegram y capa fundamental.
+    `docs/PHASE_2_REPORT.md` (nuevo).
+
+- **[2026-07-03]** **Paper ledger interno** (`services/execution/
+  paper_ledger.py`) — sustituto temporal del executor OCO real mientras no
+  existan credenciales de testnet, para poder ver rentabilidad forward de
+  las señales del sistema sin ninguna credencial:
+  - Cuando el risk engine aprueba una entrada (`would_enter_no_executor`),
+    `run_scan_cycle` y `/analiza <PAR> operar` abren ahora una posición de
+    **papel** (`environment="paper"`, sin llamar a ningún exchange) y
+    registran `final_action=enter` en vez de forzar `watchlist`.
+  - La posición se sigue vela a vela (velas reales ya ingeridas) hasta
+    tocar SL, TP, invalidarse técnicamente (`invalidation_level`, nuevo
+    campo estructurado en `TechnicalSignal`, antes solo existía el string
+    legible `invalidation_rule`) o expirar por horizonte de tiempo
+    (`MAX_HOLD_HOURS_INTRADAY`/`MAX_HOLD_DAYS_SWING`, primer uso real de
+    estos parámetros). Criterio conservador: SL se comprueba antes que TP
+    si ambos se tocan en la misma vela.
+  - Escribe `trade_entries`/`trade_exits`/`equity_snapshots`/
+    `position_events` con la misma forma que usaría un executor real —
+    `services/risk/portfolio_state.py` no cambia nada y los checks de
+    cartera (`max_positions`, cooldowns, `daily_loss_limit`,
+    `drawdown_killswitch`) se activan solos en cuanto hay posiciones de
+    papel abiertas/cerradas.
+  - `app/scheduler.py::market_cycle_job` gana un tercer paso
+    (`_update_paper_positions`) tras el scan, en la misma cadencia de 15
+    min — simplificación documentada frente a los 5 min de la sección 11
+    original (pensada para el monitor real contra testnet).
+  - Migración `0003`: `trade_entries` gana `asset`, `timeframe`,
+    `horizon_class`, `invalidation_level` (el schema original solo tenía
+    `decision_log_id` para llegar al activo vía join; con el monitor
+    corriendo cada ciclo sobre posiciones abiertas, tenerlo directo en la
+    fila evita un join en cada chequeo).
+  - Pequeño refactor en `services/risk/portfolio_state.py`: `_get_equity_
+    quote` pasa a ser pública (`get_latest_equity`) y se extrae
+    `_get_equity_peak`/`compute_drawdown_pct`, reutilizados por el paper
+    ledger al cerrar una posición — mismo cálculo de drawdown que el risk
+    engine, sin duplicarlo.
+  - `scripts/estado.py` (nuevo, equivalente CLI de `/estado`, sección 21 —
+    hoy solo speced para Telegram, bloqueado por credenciales): sistema,
+    régimen BTC, equity y drawdown actuales, posiciones de papel abiertas,
+    y resumen de rentabilidad de las cerradas (win rate, pnl total, pnl%
+    medio, profit factor).
+  - Tests: 9 casos unitarios de `evaluate_exit` (SL, TP, SL-gana-a-TP en la
+    misma vela, invalidación, sin salida, anti look-ahead, salida por
+    tiempo en sus dos variantes) + 2 tests de integración nuevos contra
+    Postgres real (`tests/integration/test_paper_ledger.py`): apertura +
+    cierre directo, y `update_open_positions` cerrando por velas reales
+    insertadas a mano. 57/57 tests unitarios + 3/3 integración en verde,
+    `mypy --strict` limpio (`services/execution` añadido al scope de
+    mypy en `pyproject.toml`).
+  - **Bug de infraestructura de tests encontrado y corregido**: el engine
+    async de `db/session.py` es un singleton a nivel de módulo, pero
+    pytest-asyncio (config por defecto) crea un event loop nuevo por test
+    — al reutilizar conexiones pooladas de un loop en otro, asyncpg
+    revienta (`Future attached to a different loop`). Corregido fijando
+    `asyncio_default_fixture_loop_scope`/`asyncio_default_test_loop_scope
+    = "session"` en `pyproject.toml`.
+  - **Bug propio encontrado y corregido en el mismo desarrollo**: los
+    primeros tests de integración no limpiaban las filas de
+    `equity_snapshots` que generaban (para no arriesgarse a borrar datos
+    reales de otro entorno) — pero al no existir todavía ningún cierre
+    real de paper trading, esas filas de test (fechadas en 2026-01-01)
+    quedaban como "la última equity conocida" y corrompían `/estado`.
+    Corregido acotando el borrado por `ts < TEST_EQUITY_CUTOFF` (rango de
+    fechas exclusivo de los fixtures, muy anterior a cualquier operación
+    real) y purgadas las filas ya escritas en la DB de desarrollo.
+  - `# DECISION` nuevo en `ESPECIFICACION_SISTEMA_TRADING.md` sección
+    10.1: documenta esta sustitución temporal del `paper_ledger` real
+    (fills de testnet) por la simulación interna.
+  - Verificado con el stack completo: `docker compose up -d --build`
+    (migración 0003 aplicada limpia), varios ciclos automáticos completos
+    (ingesta → scan → paper positions) sin errores, `/analiza <PAR>
+    operar` probado contra 9 pares del universo (sin setup real disponible
+    en el momento de la verificación — igual que sesiones anteriores,
+    confirma que el camino de apertura solo se activa con una aprobación
+    real del risk engine) y `/estado` mostrando el estado correcto.
+
 ## 2026-07-02
 
 - **[2026-07-02 12:27]** Añadido `ESPECIFICACION_SISTEMA_TRADING.md`: documento

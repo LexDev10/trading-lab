@@ -10,8 +10,10 @@ from datetime import UTC, datetime
 
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from app.config import get_settings
 from db.models import SystemState
 from db.session import get_session
+from notifications.telegram import send_message
 
 
 async def rearm() -> None:
@@ -28,6 +30,7 @@ async def rearm() -> None:
         await session.execute(stmt)
         await session.commit()
     print("Sistema rearmado. state=running.")
+    await send_message(get_settings(), "✅ <b>Sistema rearmado</b>. state=running.")
 
 
 if __name__ == "__main__":

@@ -356,6 +356,24 @@ Riesgo fijo fraccional: arriesgar `RISK_PER_TRADE` (default **0.5%** del equity)
 ### 10.1 Paper trading
 Se usa **Binance Spot Testnet** con el mismo código (`ENVIRONMENT=testnet` cambia base URL y keys). El `paper_ledger` calcula equity con fills reales de testnet + fee simulada de 0.1% por lado. Aviso conocido: la liquidez de testnet no es realista; los datos de mercado para señales se toman SIEMPRE del API de producción (solo lectura), y solo la ejecución va a testnet.
 
+> # DECISION (fase 1, implementación, 2026-07-03): mientras no existan
+> credenciales `BINANCE_API_KEY`/`SECRET` de testnet, `paper_ledger.py`
+> (`services/execution/paper_ledger.py`) sustituye el fill real de testnet
+> por una **simulación pura sobre velas ya ingeridas** (sin llamar a
+> ningún exchange): al aprobar el risk engine, abre la posición al
+> `entry_ref` de la señal y la sigue vela a vela hasta SL, TP, invalidación
+> técnica (`invalidation_rule`, ahora también expuesta como
+> `invalidation_level: Decimal` estructurado en `TechnicalSignal`) o
+> expiración por horizonte (`MAX_HOLD_HOURS_INTRADAY`/
+> `MAX_HOLD_DAYS_SWING`). Fee 0.1%/lado igual que aquí. Escribe
+> `trade_entries`/`trade_exits`/`equity_snapshots` con la misma forma que
+> usaría un executor real, así que los checks de cartera de la sección 9.2
+> se activan sin cambios. Se abandona en cuanto exista el executor OCO
+> real contra testnet — ver `services/execution/paper_ledger.py` para el
+> detalle completo y las simplificaciones explícitas (sin redondeo a
+> filtros de exchange, sin veto fundamental, monitor a la cadencia de 15
+> min del ciclo existente en vez de los 5 min de la sección 11).
+
 ---
 
 ## 11. Monitor de posiciones
@@ -399,6 +417,24 @@ Modelo local (ej. `llama3.1:8b` o `qwen2.5:7b`, configurable) con JSON Schema es
 
 ### 12.4 Rol en la decisión (fase 2)
 Solo dos efectos posibles: `veto=true` → rechazo (`fundamental_veto`) o cierre anticipado; y etiquetado de contexto en el journal. NO puede generar entradas ni "reforzar convicción" todavía (eso llega en fase 3 con la tabla de política, y solo si el scorecard lo justifica).
+
+> # DECISION (fase 2, arranque, 2026-07-03): este round implementa
+> **solo** el almacén `news_items` + ingesta RSS/JSON (Binance, CoinDesk,
+> The Block) — ver `services/fundamental/ingest_rss.py`. `social_items`,
+> `item_classifications` y `classifier_scorecard` NO se crean todavía
+> (esquema especulativo sin consumidor); se añaden en su propia migración
+> cuando se construyan Reddit (necesita registrar una app OAuth,
+> credenciales que el proyecto aún no tiene) y el clasificador Ollama
+> (necesita decidir conectividad: ¿servicio en docker-compose o
+> `host.docker.internal` contra el Ollama del host?, sin resolver
+> todavía). Binance no publica RSS público estable para anuncios: se usa
+> el endpoint JSON no documentado que consume su propia web
+> (`bapi/composite/v1/public/cms/article/catalog/list/query`, verificado
+> manualmente) — riesgo explícito de que cambie de forma sin aviso;
+> `ingest_all` es fail-closed por fuente (un fallo en una no tumba las
+> otras). `asset_tags` es una heurística determinista de palabra completa
+> contra alias conocidos (no NLP) — filtra relevancia por activo, no
+> reemplaza la clasificación real del punto 12.3, todavía sin construir.
 
 ---
 

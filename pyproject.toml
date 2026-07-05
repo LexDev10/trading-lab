@@ -18,6 +18,8 @@ dependencies = [
     "numpy>=1.26,<2.0",  # vectorbt 0.26 usa API interna de numpy retirada en 2.x
     "vectorbt>=0.26,<0.27",
     "plotly>=5.0,<5.19",  # vectorbt 0.26 usa trace types (heatmapgl) retirados en plotly posteriores
+    "httpx>=0.27,<1.0",  # alertas Telegram + descarga RSS/JSON fundamental (fase 2), async, encaja con el resto del stack
+    "feedparser>=6.0,<7.0",  # parseo de RSS estándar (CoinDesk, The Block) para el almacén PIT (sección 12.2)
 ]
 
 [dependency-groups]
@@ -29,6 +31,13 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# DECISION: session-scoped loop — `db/session.py` crea el engine/pool async
+# UNA vez a nivel de módulo; con el default de pytest-asyncio (loop nuevo
+# por test) las conexiones pooladas de un test se reutilizan en el loop de
+# otro y asyncpg revienta ("Future attached to a different loop"). Detectado
+# al añadir tests/integration/test_paper_ledger.py.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 testpaths = ["tests/unit"]
 markers = [
     "integration: necesita Postgres real (DATABASE_URL); correr con: pytest tests/integration",
@@ -36,7 +45,11 @@ markers = [
 
 [tool.mypy]
 strict = true
-files = ["core", "services/risk"]
+files = ["core", "services/risk", "services/execution", "notifications", "services/fundamental", "services/reporting"]
+
+[[tool.mypy.overrides]]
+module = "feedparser"
+ignore_missing_imports = true
 
 [build-system]
 requires = ["hatchling"]

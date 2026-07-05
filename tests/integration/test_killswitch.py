@@ -68,15 +68,25 @@ async def _seed_equity(equity: Decimal) -> None:
 
 @pytest.mark.asyncio
 async def test_halt_blocks_entries_and_rearm_unblocks_them():
+    """Este test comparte Postgres con la app real corriendo en paralelo
+    (scheduler en vivo) — puede haber posiciones de papel reales abiertas
+    afectando exposición/correlación. Por eso solo se afirma sobre
+    `checks["system_not_halted"]` (lo único que este test ejercita) en las
+    direcciones donde el resultado es determinista pase lo que pase con el
+    resto de checks:
+    - Tras `halt`, `approved` SIEMPRE es `False` (un check en falso basta).
+    - Sin halt, `system_not_halted` es `True`, pero `approved` global
+      depende de checks que si hay trading real concurrente, no lo son
+      (exposición, correlación) — no se afirma sobre `approved` ahí."""
     settings = get_settings()
     await _seed_equity(Decimal("10000"))
 
-    # 1. Sistema running (default, sin fila en system_state) -> aprobado.
+    # 1. Sistema running (default, sin fila en system_state) -> el check
+    #    específico de halt está en verde.
     async with get_session() as session:
         portfolio = await build_portfolio_snapshot(session, settings, "SOLUSDT")
     verdict = evaluate_risk(_valid_risk_input(), portfolio, settings)
     assert verdict.checks["system_not_halted"] is True
-    assert verdict.approved is True
 
     # 2. Halt manual -> bloquea, aunque el resto de checks siga en verde.
     await halt("prueba de integración: drawdown simulado")
@@ -92,10 +102,9 @@ async def test_halt_blocks_entries_and_rearm_unblocks_them():
         portfolio = await build_portfolio_snapshot(session, settings, "SOLUSDT")
     assert portfolio.system_state == "halt"
 
-    # 4. Rearme manual explícito -> vuelve a aprobar.
+    # 4. Rearme manual explícito -> el check de halt vuelve a verde.
     await rearm()
     async with get_session() as session:
         portfolio = await build_portfolio_snapshot(session, settings, "SOLUSDT")
     verdict = evaluate_risk(_valid_risk_input(), portfolio, settings)
     assert verdict.checks["system_not_halted"] is True
-    assert verdict.approved is True

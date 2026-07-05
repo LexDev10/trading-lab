@@ -85,6 +85,7 @@ def build_technical_signal(
         rel_volume=rel_volume,
         horizon_class=_horizon_for_timeframe(timeframe),
         invalidation_rule=f"close_{timeframe}_below_{range_high}",
+        invalidation_level=range_high,
         evidence={
             "range_high": str(range_high),
             "range_low": str(range_low),
