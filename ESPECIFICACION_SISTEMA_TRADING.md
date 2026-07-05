@@ -636,7 +636,7 @@ ENTRY_TTL_MINUTES=45
 MAX_HOLD_HOURS_INTRADAY=48
 MAX_HOLD_DAYS_SWING=7
 USE_REMOTE_LLM=false
-OLLAMA_MODEL=qwen2.5:7b
+OLLAMA_MODEL=qwen3.5:9b
 LIVE_MAX_CAPITAL=0             # debe fijarlo el usuario explícitamente
 TELEGRAM_BOT_TOKEN= / TELEGRAM_CHAT_ID=
 BINANCE_API_KEY= / BINANCE_API_SECRET=   # testnet y live separadas
@@ -647,6 +647,24 @@ BINANCE_API_KEY= / BINANCE_API_SECRET=   # testnet y live separadas
 # sección 13.
 RANGE_LOOKBACK_CANDLES=20      # nº de velas previas que definen el rango roto
 VOLUME_CONFIRM_MULT=1.5        # rel_volume mínimo para confirmar ruptura
+
+# DECISION (fase 2, 2026-07-03): el documento nombra OLLAMA_MODEL pero no
+# dice cómo conecta la app con el servidor Ollama, ni da un modelo por
+# defecto obligatorio (solo ejemplos: "llama3.1:8b o qwen2.5:7b"). El
+# usuario decidió: (a) usar el Ollama que ya corre en SU HOST (no un
+# servicio nuevo en docker-compose) — evita duplicar/redescargar modelos
+# dentro de Docker; (b) qwen3.5:9b como modelo (ya lo tenía descargado,
+# generación más nueva que el qwen2.5:7b de ejemplo, y sin la sobrecarga
+# de latencia de un modelo de razonamiento tipo deepseek-r1 para una tarea
+# de clasificación simple y frecuente).
+OLLAMA_HOST=http://host.docker.internal:11434
+
+# DECISION (fase 2, 2026-07-03): variables no listadas originalmente para
+# Reddit OAuth Data API (sección 12.2). Se crean en
+# https://www.reddit.com/prefs/apps (tipo "script").
+REDDIT_CLIENT_ID=
+REDDIT_CLIENT_SECRET=
+REDDIT_USER_AGENT=trading-lab/0.1 (fundamental ingest)
 
 # DECISION (fase 1, implementación): equity de arranque para el risk engine
 # mientras no exista ningún `equity_snapshots` real (antes del primer fill

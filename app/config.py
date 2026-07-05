@@ -51,7 +51,19 @@ class Settings(BaseSettings):
 
     # --- LLM / fundamental (fase 2+) ---
     use_remote_llm: bool = False
-    ollama_model: str = "qwen2.5:7b"
+    ollama_model: str = "qwen3.5:9b"
+    # DECISION (2026-07-03): sin OLLAMA_HOST en el documento original — el
+    # contenedor `app` conecta al Ollama que ya corre en el HOST del
+    # usuario (decisión explícita del usuario: ya tiene modelos
+    # descargados ahí, evita duplicar/redescargar dentro de Docker).
+    # `host.docker.internal` funciona out-of-the-box en Docker Desktop
+    # (Windows/Mac); en Linux requiere el `extra_hosts` de docker-compose.yml.
+    ollama_host: str = "http://host.docker.internal:11434"
+
+    # --- Reddit OAuth Data API (fase 2, ingesta social — sección 12.2) ---
+    reddit_client_id: str = ""
+    reddit_client_secret: str = ""
+    reddit_user_agent: str = "trading-lab/0.1 (fundamental ingest)"
 
     # --- Capital real (fase 4) ---
     live_max_capital: Decimal = Decimal("0")

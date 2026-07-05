@@ -5,6 +5,37 @@ Registro cronológico de lo implementado en el proyecto. Formato:
 
 ## 2026-07-03
 
+- **[2026-07-03, tercera ronda]** **Conectividad Ollama + variables de
+  Reddit** — prepara el terreno para seguir fase 2 (clasificador +
+  ingesta social) sin construirlos todavía:
+  - `app/config.py`: `ollama_host` (nuevo, `http://host.docker.internal:
+    11434`) y `ollama_model` default cambiado a `qwen3.5:9b`. El
+    documento no especifica ni la conectividad ni un modelo obligatorio
+    (solo ejemplos: "llama3.1:8b o qwen2.5:7b") — decisión del usuario:
+    conectar al Ollama de SU HOST (ya tiene modelos descargados, evita
+    duplicar dentro de Docker) en vez de añadir un servicio `ollama` a
+    docker-compose. Modelo elegido tras comparar lo ya disponible en el
+    host (`deepseek-r1:14b`, `qwen3.5:9b`): se descartó `deepseek-r1:14b`
+    por ser un modelo de razonamiento (más lento, pensado para
+    matemáticas/lógica, no para clasificación simple y frecuente cada 15
+    min) — `qwen3.5:9b` es generación más nueva que el `qwen2.5:7b` de
+    ejemplo del documento y ya estaba descargado.
+  - `docker-compose.yml`: `extra_hosts: host.docker.internal:host-gateway`
+    en el servicio `app` — `host.docker.internal` ya funciona solo en
+    Docker Desktop (Windows/Mac); esto lo hace portable también en Linux.
+  - `app/config.py` + `.env`/`.env.example`: `REDDIT_CLIENT_ID`/
+    `REDDIT_CLIENT_SECRET`/`REDDIT_USER_AGENT` (nuevos, vacíos) —
+    variables no listadas en el documento original para la sección 12.2;
+    pendiente que el usuario cree la app en reddit.com/prefs/apps
+    (tipo "script") y las rellene.
+  - `# DECISION` nuevo en `ESPECIFICACION_SISTEMA_TRADING.md` Apéndice A
+    documentando ambas decisiones (conectividad Ollama + variables Reddit).
+  - Verificado real: `docker compose exec app curl
+    http://host.docker.internal:11434/api/tags` responde 200 con los
+    modelos del host visibles desde dentro del contenedor. 66/66 tests
+    unitarios + 5/5 integración en verde, `mypy --strict` limpio — sin
+    regresiones (cambio de config puro, sin lógica nueva).
+
 - **[2026-07-03, segunda ronda]** **Alertas de Telegram** + **arranque de
   Fase 2** (capa fundamental). Decisión del usuario: pausar el resto de
   fase 1 (executor OCO real, bloqueado por credenciales de testnet) para

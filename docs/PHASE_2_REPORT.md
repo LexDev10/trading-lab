@@ -74,20 +74,28 @@ tenía las credenciales y tenía sentido cerrarlo junto con esto.
 
 - **Reddit OAuth Data API** (r/CryptoCurrency + subreddit del activo,
   sección 12.2): necesita registrar una app en Reddit (client_id/secret),
-  credenciales que el proyecto no tiene todavía. No hay ningún
-  placeholder en `.env`/`.env.example` para esto — se añadirá cuando se
-  construya.
-- **Clasificador Ollama** (sección 12.3): necesita decidir cómo el
-  contenedor `app` llega a un servidor Ollama — el documento dice
-  "docker-compose (app + postgres + ollama opcional)" pero no hay
-  servicio `ollama` en `docker-compose.yml`, ni un `OLLAMA_HOST`/`URL` en
-  la config (solo existe `OLLAMA_MODEL`, el nombre del modelo). Dos
-  caminos: (a) añadir `ollama` como servicio de docker-compose, o (b)
-  conectar contra el Ollama que ya corre en el host del usuario vía
-  `host.docker.internal`. Sin resolver — pendiente de decisión del
-  usuario en la siguiente iteración.
+  credenciales que el usuario todavía no ha creado. **Actualización
+  (2026-07-03, tercera ronda)**: las variables `REDDIT_CLIENT_ID`/
+  `REDDIT_CLIENT_SECRET`/`REDDIT_USER_AGENT` ya están declaradas en
+  `app/config.py`/`.env`/`.env.example` (vacías) — solo falta que el
+  usuario cree la app en reddit.com/prefs/apps y las rellene, y construir
+  `services/fundamental/ingest_reddit.py`.
+- **Clasificador Ollama** (sección 12.3): necesitaba decidir cómo el
+  contenedor `app` llega a un servidor Ollama. **Resuelto (2026-07-03,
+  tercera ronda)**: conecta al Ollama que corre en el host del usuario
+  vía `OLLAMA_HOST=http://host.docker.internal:11434` (nuevo en
+  `app/config.py`; `docker-compose.yml` añade `extra_hosts` para que
+  funcione también en Linux) — verificado con `curl` desde dentro del
+  contenedor, responde 200 y ve los modelos del host. Modelo elegido:
+  `qwen3.5:9b` (ya descargado en el host; se descartó `deepseek-r1:14b`
+  por ser un modelo de razonamiento, de más latencia, pensado para
+  problemas de lógica/matemáticas y no para clasificación simple y
+  frecuente). Lo que sigue faltando es el clasificador en sí: prompt,
+  JSON Schema estricto, parseo de la respuesta, y escritura en
+  `item_classifications` (tabla todavía no creada).
 - `item_classifications`, `social_items`, `classifier_scorecard`: schema
-  no creado (ver arriba, sin consumidor todavía).
+  no creado (sin consumidor todavía — se añaden cuando se construya el
+  clasificador/Reddit).
 - Veto fundamental (`RejectionReason.fundamental_veto`, ya existe el
   enum) sin ningún emisor todavía — llega junto con el clasificador.
 

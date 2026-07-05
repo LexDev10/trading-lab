@@ -112,6 +112,24 @@ fuente falla de forma independiente (un feed caído no tumba las otras).
 Todavía **no** hay clasificación (Ollama) ni veto fundamental — ver
 limitaciones y `docs/PHASE_2_REPORT.md`.
 
+**Conectividad con Ollama** (para cuando se construya el clasificador,
+sección 12.3): el contenedor `app` se conecta al Ollama que corre en el
+**host** del usuario (no un servicio nuevo en docker-compose) vía
+`OLLAMA_HOST=http://host.docker.internal:11434` — ya verificado que
+resuelve y responde (`docker compose exec app curl
+http://host.docker.internal:11434/api/tags`). `docker-compose.yml` fija
+`extra_hosts: host.docker.internal:host-gateway` para que esto funcione
+también en Linux (en Docker Desktop/Windows/Mac ya es automático).
+`OLLAMA_MODEL=qwen3.5:9b` por defecto (no `qwen2.5:7b`, que era solo un
+ejemplo del documento) — modelo general ya disponible en el host, sin
+la sobrecarga de latencia de un modelo de razonamiento para una tarea de
+clasificación simple y frecuente.
+
+**Reddit OAuth** (para cuando se construya esa ingesta): variables
+`REDDIT_CLIENT_ID`/`REDDIT_CLIENT_SECRET`/`REDDIT_USER_AGENT` ya
+declaradas en `.env.example`/`app/config.py`, pendientes de rellenar
+(crear la app en https://www.reddit.com/prefs/apps, tipo "script").
+
 ## Halt / rearme manual del killswitch
 
 ```bash
@@ -192,11 +210,13 @@ docker compose exec app uv run alembic upgrade head
   compone los trades out-of-sample de forma secuencial (no simula cartera
   multi-posición real) — limitaciones completas en `backtests/RESULTS.md`.
 - Fase 2 (capa fundamental) está solo arrancada: hay almacén PIT + ingesta
-  RSS/JSON, pero no hay Reddit (necesita registrar una app OAuth,
-  credenciales que el proyecto aún no tiene), ni clasificador Ollama
-  (necesita decidir conectividad: servicio en docker-compose vs Ollama del
-  host), ni `classifier_scorecard`, ni veto fundamental — el sistema sigue
-  operando 100% técnico (`MODE=technical_only`). El endpoint de anuncios
-  de Binance usado no es RSS oficial ni documentado (ver `# DECISION` en
-  la sección 12.2 del documento) — puede romperse sin aviso; está aislado
+  RSS/JSON, y ya está resuelta la conectividad con Ollama (host del
+  usuario, ver arriba) y las variables de Reddit declaradas — pero
+  todavía no hay Reddit (falta rellenar `REDDIT_CLIENT_ID`/`SECRET`, el
+  usuario tiene que crear la app en reddit.com/prefs/apps), ni
+  clasificador (JSON Schema, prompt, `item_classifications`), ni
+  `classifier_scorecard`, ni veto fundamental — el sistema sigue operando
+  100% técnico (`MODE=technical_only`). El endpoint de anuncios de
+  Binance usado no es RSS oficial ni documentado (ver `# DECISION` en la
+  sección 12.2 del documento) — puede romperse sin aviso; está aislado
   por fuente (fail-closed local, no tumba las otras dos).

@@ -25,6 +25,12 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-trading}@postgres:5432/${POSTGRES_DB:-trading_lab}
     ports:
       - "8000:8000"
+    extra_hosts:
+      # host.docker.internal ya funciona out-of-the-box en Docker Desktop
+      # (Windows/Mac); esto lo hace portable también en Linux, donde no
+      # existe por defecto. Necesario para que el contenedor llegue al
+      # Ollama que corre en el host (OLLAMA_HOST, sección 12.3).
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy
