@@ -1,0 +1,31 @@
+{
+  "kind": "Listing",
+  "data": {
+    "children": [
+      {
+        "kind": "t3",
+        "data": {
+          "id": "abc123",
+          "title": "Bitcoin just broke a new resistance level",
+          "selftext": "Big move today, volume confirms it.",
+          "score": 150,
+          "num_comments": 42,
+          "created_utc": 1751328000,
+          "permalink": "/r/Bitcoin/comments/abc123/bitcoin_just_broke/"
+        }
+      },
+      {
+        "kind": "t3",
+        "data": {
+          "id": "def456",
+          "title": "Daily discussion thread",
+          "selftext": "",
+          "score": 5,
+          "num_comments": 1,
+          "created_utc": 1751328100,
+          "permalink": "/r/Bitcoin/comments/def456/daily_discussion/"
+        }
+      }
+    ]
+  }
+}

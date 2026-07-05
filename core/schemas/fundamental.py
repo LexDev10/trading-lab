@@ -1,7 +1,6 @@
-"""Contrato del almacén PIT (sección 12.1, fase 2). Solo `NewsItem` por
-ahora — `SocialItem`/`ItemClassification` se añaden cuando se construya
-Reddit/el clasificador (fuera de este arranque de fase, ver
-`services/fundamental/ingest_rss.py`)."""
+"""Contrato del almacén PIT (sección 12.1, fase 2). `ItemClassification`
+se añade cuando se construya el clasificador Ollama (todavía fuera de
+alcance, ver `docs/PHASE_2_REPORT.md`)."""
 
 from typing import Any
 
@@ -17,4 +16,17 @@ class NewsItem(BaseModel):
     published_at: AwareDatetime | None
     fetched_at: AwareDatetime
     content_hash: str
+    raw: dict[str, Any]
+
+
+class SocialItem(BaseModel):
+    platform: str
+    subreddit: str
+    post_id: str
+    title: str
+    body_text: str | None
+    score_at_fetch: int
+    num_comments_at_fetch: int
+    published_at: AwareDatetime | None
+    fetched_at: AwareDatetime
     raw: dict[str, Any]

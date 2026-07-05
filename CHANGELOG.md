@@ -3,6 +3,46 @@
 Registro cronológico de lo implementado en el proyecto. Formato:
 `[YYYY-MM-DD HH:MM] Descripción`.
 
+## 2026-07-05
+
+- **[2026-07-05]** **Ingesta de Reddit** (`services/fundamental/
+  ingest_reddit.py`, sección 12.2) — completa la ingesta social del
+  almacén PIT junto a la RSS/JSON de la ronda anterior:
+  - Migración `0005`: tabla `social_items` (sección 12.1) — `platform,
+    subreddit, post_id UNIQUE, title, body_text, score_at_fetch,
+    num_comments_at_fetch, published_at, fetched_at, raw_jsonb`.
+    Idempotente por `post_id` (identificador propio de Reddit, no hace
+    falta un `content_hash` calculado como en `news_items`).
+  - `core/schemas/fundamental.py::SocialItem` (Pydantic).
+  - `services/fundamental/ingest_reddit.py`: mismo patrón que
+    `ingest_rss.py` (separación red/parseo, fail-closed por subreddit).
+    **Grant OAuth `client_credentials`** (app-only, sin usuario/
+    contraseña de Reddit) — solo se necesita lectura pública de r/
+    CryptoCurrency + el subreddit de cada activo del universo
+    (`ASSET_SUBREDDITS`, mapeo best-effort ya que el documento no los
+    nombra), nunca acciones en nombre de una cuenta. Sin
+    `REDDIT_CLIENT_ID`/`SECRET` configurados, `ingest_all` no intenta
+    nada por red (no es un error).
+  - `app/scheduler.py::_fundamental_ingest` ahora corre RSS y Reddit en
+    sesiones de DB separadas (si Reddit falla catastróficamente no
+    deshace lo que RSS ya confirmó) dentro del mismo job
+    `fundamental_ingest_job`.
+  - Tests: 2 unitarios nuevos (`test_ingest_reddit.py`: parseo de listado
+    contra fixture grabada `tests/fixtures/reddit_listing_sample.json`,
+    no-op confirmado sin credenciales — monkeypatch de `httpx.AsyncClient`
+    que lanza si se llega a invocar) + 1 de integración (idempotencia de
+    `persist_social_items`). 68/68 unitarios + 6/6 integración en verde,
+    `mypy --strict` limpio (23 archivos).
+  - **Bloqueante externo, no de código**: el registro de la app de Reddit
+    del usuario quedó atascado en el propio proceso de verificación de
+    desarrollador de Reddit ("Responsible Builder Policy" + registro de
+    API aparte) — fuera de nuestro control. El código queda listo y
+    verificado (no-op limpio); solo falta que el usuario complete ese
+    registro en reddit.com y rellene `REDDIT_CLIENT_ID`/`SECRET` en `.env`.
+  - `# DECISION` nuevo en `ESPECIFICACION_SISTEMA_TRADING.md` sección
+    12.2 (grant OAuth elegido + mapeo de subreddits). `README.md` y
+    `docs/PHASE_2_REPORT.md` actualizados.
+
 ## 2026-07-03
 
 - **[2026-07-03, tercera ronda]** **Conectividad Ollama + variables de

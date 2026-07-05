@@ -2,9 +2,12 @@
 
 Estado: **arrancada, lejos de cerrada**. Se implementó lo que se puede
 construir y verificar honestamente sin credenciales adicionales: el
-almacén PIT (`news_items`) y la ingesta RSS/JSON. Reddit y el clasificador
-Ollama — el corazón de la sección 12 — quedan explícitamente fuera de
-este round.
+almacén PIT (`news_items` + `social_items`) y la ingesta RSS/JSON +
+Reddit, además de la conectividad con Ollama. El clasificador en sí (el
+corazón de la sección 12) queda fuera todavía, y la ingesta de Reddit
+está lista pero inactiva hasta que el usuario complete el registro de
+desarrollador de Reddit (bloqueante externo, no de código — ver más
+abajo).
 
 **Decisión del usuario** que motiva este documento: pausar el resto de
 fase 1 (executor OCO real, bloqueado por credenciales de testnet) y
@@ -70,38 +73,62 @@ tenía las credenciales y tenía sentido cerrarlo junto con esto.
 - `app/scheduler.py::fundamental_ingest_job`: job independiente de
   `market_cycle_job`, misma cadencia (`SCAN_INTERVAL_MINUTES`).
 
+### Ingesta de Reddit (2026-07-05, sección 12.1/12.2)
+
+- Migración `0005`: tabla `social_items` (`platform, subreddit, post_id
+  UNIQUE, title, body_text, score_at_fetch, num_comments_at_fetch,
+  published_at, fetched_at, raw_jsonb`). Idempotente por `post_id`
+  (identificador propio de Reddit — no hace falta un `content_hash`
+  calculado como en `news_items`).
+- `core/schemas/fundamental.py::SocialItem` (Pydantic).
+- `services/fundamental/ingest_reddit.py`: mismo patrón que
+  `ingest_rss.py` (separación red/parseo, fail-closed por subreddit).
+  **Grant OAuth `client_credentials`** (app-only, sin usuario/contraseña
+  de Reddit) — solo necesitamos lectura pública de listados, nunca
+  acciones en nombre de una cuenta; evita guardar credenciales de una
+  cuenta personal. Ingesta: r/CryptoCurrency + el subreddit de cada
+  activo del universo (`ASSET_SUBREDDITS`, mapeo best-effort ya que la
+  sección 12.2 no los nombra explícitamente — un nombre desactualizado
+  solo produce 0 items para ese activo, no rompe nada).
+- Sin `REDDIT_CLIENT_ID`/`SECRET` configurados, `ingest_all` no intenta
+  nada por red (no es un error) — mismo criterio que
+  `notifications/telegram.py` sin credenciales de Telegram. Verificado en
+  vivo: el log del job no muestra ninguna clave `reddit_*` cuando las
+  credenciales están vacías.
+- `app/scheduler.py::_fundamental_ingest`: RSS y Reddit corren en
+  sesiones de DB separadas dentro del mismo job — si Reddit falla
+  catastróficamente no deshace lo que RSS ya confirmó.
+- **Bloqueante externo, no de código**: al intentar registrar la app en
+  reddit.com/prefs/apps, Reddit exigió completar su propio proceso de
+  verificación de desarrollador ("Responsible Builder Policy" + registro
+  de API aparte) antes de dejar crear la app — fuera de nuestro control,
+  pendiente de que el usuario lo complete. El código en sí está terminado
+  y verificado (no-op limpio sin credenciales); en cuanto el usuario
+  rellene `REDDIT_CLIENT_ID`/`SECRET` en `.env`, la ingesta empieza a
+  traer datos reales sin tocar más código.
+
 ## Qué quedó fuera (y por qué)
 
-- **Reddit OAuth Data API** (r/CryptoCurrency + subreddit del activo,
-  sección 12.2): necesita registrar una app en Reddit (client_id/secret),
-  credenciales que el usuario todavía no ha creado. **Actualización
-  (2026-07-03, tercera ronda)**: las variables `REDDIT_CLIENT_ID`/
-  `REDDIT_CLIENT_SECRET`/`REDDIT_USER_AGENT` ya están declaradas en
-  `app/config.py`/`.env`/`.env.example` (vacías) — solo falta que el
-  usuario cree la app en reddit.com/prefs/apps y las rellene, y construir
-  `services/fundamental/ingest_reddit.py`.
-- **Clasificador Ollama** (sección 12.3): necesitaba decidir cómo el
-  contenedor `app` llega a un servidor Ollama. **Resuelto (2026-07-03,
-  tercera ronda)**: conecta al Ollama que corre en el host del usuario
-  vía `OLLAMA_HOST=http://host.docker.internal:11434` (nuevo en
-  `app/config.py`; `docker-compose.yml` añade `extra_hosts` para que
-  funcione también en Linux) — verificado con `curl` desde dentro del
-  contenedor, responde 200 y ve los modelos del host. Modelo elegido:
-  `qwen3.5:9b` (ya descargado en el host; se descartó `deepseek-r1:14b`
-  por ser un modelo de razonamiento, de más latencia, pensado para
-  problemas de lógica/matemáticas y no para clasificación simple y
-  frecuente). Lo que sigue faltando es el clasificador en sí: prompt,
-  JSON Schema estricto, parseo de la respuesta, y escritura en
-  `item_classifications` (tabla todavía no creada).
-- `item_classifications`, `social_items`, `classifier_scorecard`: schema
-  no creado (sin consumidor todavía — se añaden cuando se construya el
-  clasificador/Reddit).
+- **Reddit OAuth Data API**: código completo (ver arriba), bloqueado por
+  el registro de desarrollador de Reddit — pendiente del usuario, no de
+  trabajo de código.
+- **Conectividad con Ollama**: resuelta (ver README, sección
+  "Capa fundamental") — `OLLAMA_HOST=http://host.docker.internal:11434`,
+  modelo `qwen3.5:9b` (se descartó `deepseek-r1:14b` por ser un modelo de
+  razonamiento, más lento y pensado para lógica/matemáticas, no para
+  clasificación simple y frecuente), verificado con `curl` desde dentro
+  del contenedor.
+- **Clasificador en sí** (sección 12.3): prompt, JSON Schema estricto,
+  parseo de la respuesta y escritura en `item_classifications` — todavía
+  sin construir.
+- `item_classifications`, `classifier_scorecard`: schema no creado (sin
+  consumidor todavía — se añaden cuando se construya el clasificador).
 - Veto fundamental (`RejectionReason.fundamental_veto`, ya existe el
   enum) sin ningún emisor todavía — llega junto con el clasificador.
 
 ## Tests
 
-**9 tests unitarios nuevos** (sin DB):
+**11 tests unitarios nuevos** (sin DB):
 - `test_telegram.py`: no-op sin credenciales, arma bien el payload con
   credenciales, fail-open ante una excepción de red simulada.
 - `test_ingest_rss.py`: `extract_asset_tags` (nombre completo vs ticker,
@@ -109,19 +136,25 @@ tenía las credenciales y tenía sentido cerrarlo junto con esto.
   `content_hash` determinista, parseo de RSS/JSON contra fixtures
   grabadas (`tests/fixtures/rss_sample.xml`,
   `tests/fixtures/binance_announcements_sample.json`).
+- `test_ingest_reddit.py` (2026-07-05): parseo de listado contra fixture
+  grabada (`tests/fixtures/reddit_listing_sample.json`), y no-op
+  confirmado sin credenciales — monkeypatch de `httpx.AsyncClient` que
+  lanza si se llega a invocar (garantiza que de verdad no toca la red).
 
-**3 tests de integración nuevos** (Postgres real):
+**6 tests de integración nuevos** (Postgres real):
 - `test_ingest_rss.py::test_persist_news_items_is_idempotent`: reingestar
   los mismos items no duplica filas (`ON CONFLICT DO NOTHING`).
+- `test_ingest_reddit.py::test_persist_social_items_is_idempotent`
+  (2026-07-05): mismo criterio, idempotencia por `post_id`.
 - `test_daily_summary.py`: agregación de rechazos por motivo y trades del
   día. **Importante**: afirma sobre el DELTA introducido por los datos
   sembrados, no sobre valores absolutos — el resumen diario agrega datos
   GLOBALES y este test corre contra la misma Postgres que la app real en
   paralelo (ver hallazgo abajo).
 
-Total: **66/66 unitarios + 5/5 integración** en verde. `mypy --strict`
+Total: **68/68 unitarios + 6/6 integración** en verde. `mypy --strict`
 ampliado a `notifications/`, `services/fundamental/`,
-`services/reporting/` (22 archivos, sin errores).
+`services/reporting/` (23 archivos, sin errores).
 
 ## Hallazgo durante la verificación: el paper ledger operó solo, de principio a fin
 
@@ -163,14 +196,18 @@ tras el fix, sin fallos.
 ## Cómo reproducir la verificación
 
 ```bash
-docker compose up -d --build   # aplica migración 0004
+docker compose up -d --build   # aplica migraciones 0004 y 0005
 docker compose run --rm --no-deps app uv run pytest -v
 docker compose exec app uv run pytest tests/integration -v
 docker compose run --rm --no-deps app uv run mypy
 docker compose exec app uv run python -m scripts.halt "prueba"
 docker compose exec app uv run python -m scripts.rearm
 docker compose exec app uv run python -m scripts.estado
+docker compose exec app curl http://host.docker.internal:11434/api/tags
 ```
 Confirmar por `psql` que `news_items` se llena con artículos reales de
-las 3 fuentes, y en el Telegram real del usuario que llegan los mensajes
-de halt/rearme.
+las 3 fuentes RSS/JSON, y en el Telegram real del usuario que llegan los
+mensajes de halt/rearme. `social_items` se queda vacía hasta que el
+usuario complete el registro de desarrollador de Reddit y rellene
+`REDDIT_CLIENT_ID`/`SECRET` — el log de `fundamental_ingest_job` no debe
+mostrar ninguna excepción por eso (no-op silencioso, confirmado).

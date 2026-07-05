@@ -412,6 +412,21 @@ Reglas: nunca UPDATE sobre items; reclasificar = nueva fila en `item_classificat
 - Reddit OAuth Data API: r/CryptoCurrency + subreddit del activo; top/new con score y comentarios en el momento del fetch.
 - Fetch cada 15 min. NewsAPI opcional detrás de flag. X/Twitter: NO.
 
+> # DECISION (fase 2, 2026-07-03): ingesta de Reddit implementada en
+> `services/fundamental/ingest_reddit.py` — grant OAuth
+> `client_credentials` ("app-only", sin usuario/contraseña de Reddit):
+> solo se necesita lectura pública de listados, ninguna acción en nombre
+> de una cuenta, así que no hace falta guardar credenciales personales
+> (`REDDIT_CLIENT_ID`/`SECRET`/`USER_AGENT` en Apéndice A). El documento
+> no nombra qué subreddit corresponde a "el activo" para cada par del
+> universo — mapeo best-effort en `ASSET_SUBREDDITS` (ej. BTC→r/Bitcoin,
+> ETH→r/ethereum); si algún nombre queda desactualizado, esa fuente
+> simplemente no aporta items (`ingest_all` es fail-closed por
+> subreddit, igual que por fuente RSS — sección 12.2). Sin credenciales
+> configuradas, `ingest_all` no intenta nada por red (no es un error, es
+> un requisito externo pendiente, mismo criterio que
+> `notifications/telegram.py`).
+
 ### 12.3 Clasificador (Ollama, structured outputs)
 Modelo local (ej. `llama3.1:8b` o `qwen2.5:7b`, configurable) con JSON Schema estricto → `stance` (enum), `event_types` (enums), `veto` (bool), `summary` (str). Temperatura 0. Registrar `model_name+version` en cada clasificación. **Evaluación:** job semanal calcula hit-rate de cada stance contra retornos realizados a 4h/24h/72h → tabla `classifier_scorecard`. Esto es lo que decide si la capa aporta señal.
 

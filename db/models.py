@@ -165,6 +165,27 @@ class NewsItem(Base):
     raw_jsonb: Mapped[dict] = mapped_column(JSONB)
 
 
+class SocialItem(Base):
+    """Almacén point-in-time inmutable (sección 12.1, fase 2) — Reddit.
+    Append-only, igual que `NewsItem`: nunca UPDATE; idempotente por
+    `post_id` (identificador propio de Reddit, no hace falta un
+    `content_hash` calculado)."""
+
+    __tablename__ = "social_items"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    platform: Mapped[str] = mapped_column(String(20))
+    subreddit: Mapped[str] = mapped_column(String(50))
+    post_id: Mapped[str] = mapped_column(String(20), unique=True)
+    title: Mapped[str] = mapped_column(String(500))
+    body_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    score_at_fetch: Mapped[int] = mapped_column(Integer)
+    num_comments_at_fetch: Mapped[int] = mapped_column(Integer)
+    published_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+    fetched_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
+    raw_jsonb: Mapped[dict] = mapped_column(JSONB)
+
+
 class SystemState(Base):
     """Fila única (id=1) con el estado global running/halt.
 

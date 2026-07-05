@@ -20,7 +20,7 @@ from notifications.telegram import send_message
 from services.data.binance_market_data import BinanceMarketData
 from services.data.persistence import insert_market_snapshots, upsert_asset, upsert_candles
 from services.execution.paper_ledger import update_open_positions
-from services.fundamental.ingest_rss import ingest_all
+from services.fundamental import ingest_reddit, ingest_rss
 from services.reporting.daily_summary import build_daily_summary
 from services.scanner.scanner import run_scan_cycle
 
@@ -74,18 +74,27 @@ async def _update_paper_positions(now: datetime) -> None:
 
 
 async def _fundamental_ingest(now: datetime) -> None:
+    settings = get_settings()
     log = logger.bind(job="fundamental_ingest", started_at=now.isoformat())
     log.info("job.start")
 
+    counts: dict[str, int] = {}
     async with get_session() as session:
-        counts = await ingest_all(session, now)
+        counts.update(await ingest_rss.ingest_all(session, now))
+        await session.commit()
+
+    # Sesión separada: si Reddit falla catastróficamente, no debe
+    # deshacer lo que RSS ya confirmó. Sin credenciales, ingest_reddit
+    # devuelve {} sin tocar la red (no es un error).
+    async with get_session() as session:
+        counts.update(await ingest_reddit.ingest_all(session, settings, now))
         await session.commit()
 
     log.info("job.success", **counts)
 
 
 async def fundamental_ingest_job() -> None:
-    """Ingesta RSS/JSON al almacén PIT (sección 12.2), cada
+    """Ingesta RSS/JSON + Reddit al almacén PIT (sección 12.2), cada
     `SCAN_INTERVAL_MINUTES` — job independiente de `market_cycle_job`: un
     feed caído no debe afectar al escaneo técnico ni viceversa."""
     started_at = datetime.now(tz=UTC)

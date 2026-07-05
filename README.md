@@ -9,9 +9,10 @@ Estado actual: **Fase 0 completa**, **Fase 1 pausada en progreso** (todo
 listo salvo el executor OCO real contra testnet, bloqueado por
 credenciales — scanner automático, risk engine, `/analiza`, `/estado`,
 backtesting walk-forward, paper ledger interno y **alertas de Telegram**
-ya funcionan), **Fase 2 en arranque** (almacén PIT + ingesta RSS/JSON
-funcionando; clasificador Ollama y Reddit quedan para una siguiente
-iteración). Ver [docs/PHASE_0_REPORT.md](docs/PHASE_0_REPORT.md),
+ya funcionan), **Fase 2 en arranque** (almacén PIT + ingesta RSS/JSON +
+**ingesta de Reddit** funcionando — conectividad con Ollama ya resuelta;
+falta rellenar credenciales de Reddit y construir el clasificador). Ver
+[docs/PHASE_0_REPORT.md](docs/PHASE_0_REPORT.md),
 [docs/PHASE_1_REPORT.md](docs/PHASE_1_REPORT.md) y
 [docs/PHASE_2_REPORT.md](docs/PHASE_2_REPORT.md).
 
@@ -105,10 +106,19 @@ sistema): un aviso perdido no puede tumbar un ciclo del scheduler.
 
 ## Capa fundamental (fase 2, arranque)
 
-Cada `SCAN_INTERVAL_MINUTES` se ingesta al almacén PIT inmutable
-(`news_items`, sección 12.1) desde anuncios de Binance, CoinDesk y The
-Block (`services/fundamental/ingest_rss.py`), sin credenciales. Cada
-fuente falla de forma independiente (un feed caído no tumba las otras).
+Cada `SCAN_INTERVAL_MINUTES` se ingesta al almacén PIT inmutable desde
+dos frentes independientes (un fallo en uno no afecta al otro ni al ciclo
+técnico):
+- **RSS/JSON** (`news_items`, sección 12.1) desde anuncios de Binance,
+  CoinDesk y The Block (`services/fundamental/ingest_rss.py`), sin
+  credenciales. Cada fuente falla de forma independiente.
+- **Reddit** (`social_items`) desde r/CryptoCurrency + el subreddit de
+  cada activo del universo (`services/fundamental/ingest_reddit.py`),
+  vía OAuth `client_credentials` (app-only, sin usuario/contraseña de
+  Reddit — solo lectura pública). **Requiere**
+  `REDDIT_CLIENT_ID`/`REDDIT_CLIENT_SECRET` en `.env`; sin ellos no hace
+  nada (no falla). Cada subreddit falla de forma independiente.
+
 Todavía **no** hay clasificación (Ollama) ni veto fundamental — ver
 limitaciones y `docs/PHASE_2_REPORT.md`.
 
@@ -210,12 +220,14 @@ docker compose exec app uv run alembic upgrade head
   compone los trades out-of-sample de forma secuencial (no simula cartera
   multi-posición real) — limitaciones completas en `backtests/RESULTS.md`.
 - Fase 2 (capa fundamental) está solo arrancada: hay almacén PIT + ingesta
-  RSS/JSON, y ya está resuelta la conectividad con Ollama (host del
-  usuario, ver arriba) y las variables de Reddit declaradas — pero
-  todavía no hay Reddit (falta rellenar `REDDIT_CLIENT_ID`/`SECRET`, el
-  usuario tiene que crear la app en reddit.com/prefs/apps), ni
-  clasificador (JSON Schema, prompt, `item_classifications`), ni
-  `classifier_scorecard`, ni veto fundamental — el sistema sigue operando
+  RSS/JSON + Reddit, y ya está resuelta la conectividad con Ollama (host
+  del usuario, ver arriba) — pero `REDDIT_CLIENT_ID`/`SECRET` siguen
+  vacíos (el registro de la app en reddit.com/prefs/apps quedó bloqueado
+  por el propio proceso de verificación de desarrollador de Reddit, fuera
+  de nuestro control) así que la ingesta de Reddit no hace nada todavía
+  (no falla, solo no aporta datos). Tampoco hay clasificador (JSON
+  Schema, prompt, `item_classifications`), ni `classifier_scorecard`, ni
+  veto fundamental — el sistema sigue operando
   100% técnico (`MODE=technical_only`). El endpoint de anuncios de
   Binance usado no es RSS oficial ni documentado (ver `# DECISION` en la
   sección 12.2 del documento) — puede romperse sin aviso; está aislado
