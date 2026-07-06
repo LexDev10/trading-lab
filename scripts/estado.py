@@ -11,12 +11,12 @@ Uso (con el stack levantado):
 
 import asyncio
 from datetime import UTC, datetime
-from decimal import Decimal
 
 from sqlalchemy import select
 
-from db.models import EquitySnapshot, RegimeLog, SystemState, TradeEntry, TradeExit
+from db.models import EquitySnapshot, RegimeLog, SystemState, TradeEntry
 from db.session import get_session
+from services.reporting.dashboard_data import compute_closed_trades_summary
 from services.risk.portfolio_state import ENVIRONMENT
 
 
@@ -64,31 +64,19 @@ async def _print_open_positions(session, now: datetime) -> None:
 
 
 async def _print_closed_summary(session) -> None:
-    result = await session.execute(
-        select(TradeExit.pnl_quote, TradeExit.pnl_pct_net)
-        .join(TradeEntry, TradeExit.trade_entry_id == TradeEntry.id)
-        .where(TradeEntry.environment == ENVIRONMENT)
-    )
-    rows = result.all()
-    print(f"\nOperaciones de papel cerradas: {len(rows)}")
-    if not rows:
+    summary = await compute_closed_trades_summary(session)
+    print(f"\nOperaciones de papel cerradas: {summary.n_trades}")
+    if summary.n_trades == 0:
         return
 
-    pnl_quotes = [r.pnl_quote for r in rows]
-    pnl_pcts = [r.pnl_pct_net for r in rows]
-    wins = [p for p in pnl_quotes if p > 0]
-    losses = [p for p in pnl_quotes if p <= 0]
-    win_rate = Decimal(len(wins)) / Decimal(len(rows))
-    total_pnl = sum(pnl_quotes, Decimal("0"))
-    avg_pnl_pct = sum(pnl_pcts, Decimal("0")) / Decimal(len(pnl_pcts))
-    gross_win = sum(wins, Decimal("0"))
-    gross_loss = abs(sum(losses, Decimal("0")))
-    profit_factor = (gross_win / gross_loss) if gross_loss > 0 else None
-
-    print(f"  win_rate: {win_rate:.1%}")
-    print(f"  pnl total: {total_pnl:.4f} USDT")
-    print(f"  pnl% medio por operación: {avg_pnl_pct:.2%}")
-    print(f"  profit_factor: {profit_factor:.2f}" if profit_factor is not None else "  profit_factor: n/a (sin pérdidas)")
+    print(f"  win_rate: {summary.win_rate:.1%}")
+    print(f"  pnl total: {summary.total_pnl_quote:.4f} USDT")
+    print(f"  pnl% medio por operación: {summary.avg_pnl_pct:.2%}")
+    print(
+        f"  profit_factor: {summary.profit_factor:.2f}"
+        if summary.profit_factor is not None
+        else "  profit_factor: n/a (sin pérdidas)"
+    )
 
 
 async def estado() -> None:

@@ -22,6 +22,7 @@ class RiskInput:
     spread_bps: Decimal
     min_notional: Decimal
     regime_blocks_entries: bool  # sección 8.3: trend_down/chop_high_vol de BTC
+    fundamental_veto_active: bool = False  # sección 12.4: veto=true clasificado sobre este activo
 
 
 def evaluate_risk(
@@ -38,6 +39,16 @@ def evaluate_risk(
     checks["regime_filter"] = regime_ok
     if not regime_ok:
         reasons.append(RejectionReason.regime_filter)
+
+    # Veto fundamental (sección 12.4) — mismo tratamiento que el filtro de
+    # régimen: un check más del engine, nunca se salta. El flag lo calcula
+    # el caller con `services/fundamental/veto.py::asset_has_active_veto`
+    # (única fuente de verdad, reutilizada también por el cierre anticipado
+    # del paper ledger).
+    fundamental_ok = not risk_input.fundamental_veto_active
+    checks["fundamental_veto"] = fundamental_ok
+    if not fundamental_ok:
+        reasons.append(RejectionReason.fundamental_veto)
 
     entry = risk_input.entry
     stop_loss = risk_input.stop_loss

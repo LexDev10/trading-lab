@@ -151,3 +151,37 @@ def test_time_based_exit_respects_days_horizon():
     decision = evaluate_exit(entry, [], settings, expired)
     assert decision is not None
     assert decision.exit_type == "closed_time"
+
+
+def test_veto_active_closes_immediately_even_with_no_sl_tp_touch():
+    """Sección 12.4: un veto fundamental fresco cierra la posición ANTES
+    de comprobar SL/TP/invalidación, aunque ninguno se haya tocado."""
+    entry = base_entry()
+    now = ENTRY_TIME + timedelta(hours=2)
+    # Vela "segura": no toca SL (95), TP (115) ni invalidación (98).
+    candles = [make_candle(ENTRY_TIME + timedelta(hours=1), low="99", high="105", close="102")]
+    decision = evaluate_exit(entry, candles, base_settings(), now, veto_active=True)
+    assert decision is not None
+    assert decision.exit_type == "closed_veto"
+    assert decision.exit_time == now
+    assert decision.exit_price == Decimal("102")  # último close disponible
+
+
+def test_veto_active_falls_back_to_entry_price_without_any_candle():
+    entry = base_entry()
+    now = ENTRY_TIME + timedelta(hours=2)
+    decision = evaluate_exit(entry, [], base_settings(), now, veto_active=True)
+    assert decision is not None
+    assert decision.exit_type == "closed_veto"
+    assert decision.exit_price == entry.entry_price
+
+
+def test_veto_active_wins_over_sl_touch():
+    """Un veto es más urgente que esperar a que toque el SL: si ambos
+    aplicarían, gana el veto."""
+    entry = base_entry()
+    now = ENTRY_TIME + timedelta(hours=2)
+    candles = [make_candle(ENTRY_TIME + timedelta(hours=1), low="90", high="101", close="94")]
+    decision = evaluate_exit(entry, candles, base_settings(), now, veto_active=True)
+    assert decision is not None
+    assert decision.exit_type == "closed_veto"

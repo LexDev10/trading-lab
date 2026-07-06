@@ -4,10 +4,10 @@ corresponden a fases ya implementadas (fase 0: assets, candles,
 market_snapshots; fase 1: regime_log, decision_logs, trade_entries,
 trade_exits, position_events, equity_snapshots, system_state)."""
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, PrimaryKeyConstraint, String, Text
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, Numeric, PrimaryKeyConstraint, String, Text
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -184,6 +184,48 @@ class SocialItem(Base):
     published_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
     fetched_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
     raw_jsonb: Mapped[dict] = mapped_column(JSONB)
+
+
+class ItemClassification(Base):
+    """Clasificación del clasificador Ollama (sección 12.3) sobre un
+    `NewsItem`/`SocialItem` (`item_kind`+`item_id`, sin FK porque es
+    polimórfico). Append-only, igual que el resto del almacén PIT:
+    reclasificar (otro modelo, otra versión) es una fila nueva, nunca un
+    UPDATE.
+
+    `asset_tags` no está en el schema sketch de la sección 12.1 — ver
+    `# DECISION` en la migración `0006_item_classifications.py`."""
+
+    __tablename__ = "item_classifications"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    item_id: Mapped[int] = mapped_column(Integer)
+    item_kind: Mapped[str] = mapped_column(String(10))
+    model_name: Mapped[str] = mapped_column(String(60))
+    model_version: Mapped[str] = mapped_column(String(20))
+    classified_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
+    stance: Mapped[str] = mapped_column(String(20))
+    event_types: Mapped[list[str]] = mapped_column(ARRAY(String), default=list)
+    veto: Mapped[bool] = mapped_column(Boolean, default=False)
+    summary: Mapped[str] = mapped_column(Text)
+    output_jsonb: Mapped[dict] = mapped_column(JSONB)
+    asset_tags: Mapped[list[str]] = mapped_column(ARRAY(String), default=list)
+
+
+class ClassifierScorecard(Base):
+    """Evaluación semanal del clasificador (sección 12.3/16): hit-rate y
+    retorno medio de cada `stance` contra retornos realizados a
+    4h/24h/72h. Decide si la capa fundamental aporta señal real."""
+
+    __tablename__ = "classifier_scorecard"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    week: Mapped[date] = mapped_column(Date)
+    stance: Mapped[str] = mapped_column(String(20))
+    horizon: Mapped[str] = mapped_column(String(5))
+    n: Mapped[int] = mapped_column(Integer)
+    hit_rate: Mapped[Decimal] = mapped_column(Numeric(precision=6, scale=4))
+    avg_fwd_return: Mapped[Decimal] = mapped_column(Numeric(precision=10, scale=6))
 
 
 class SystemState(Base):

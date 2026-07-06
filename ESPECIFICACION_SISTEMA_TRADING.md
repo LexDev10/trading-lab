@@ -686,6 +686,19 @@ REDDIT_USER_AGENT=trading-lab/0.1 (fundamental ingest)
 # en testnet). Una vez el paper_ledger persista snapshots reales de la
 # cuenta testnet (sección 10.1), estos los sustituyen por completo.
 PAPER_STARTING_EQUITY_USDT=10000
+
+# DECISION (fase 2, 2026-07-06): parámetros no listados originalmente,
+# necesarios para el clasificador Ollama (sección 12.3/12.4).
+FUNDAMENTAL_CLASSIFY_BATCH_SIZE=10   # items sin clasificar por corrida del job (~5-15s/item en local)
+FUNDAMENTAL_VETO_HOURS=24            # cuánto tiempo permanece activo un veto=true tras classified_at
+
+# DECISION (fase 3, 2026-07-06): el documento nombra USE_REMOTE_LLM pero
+# no dice qué proveedor ni modelo usar para el memo (sección 13). Se
+# llama a la API de mensajes de Anthropic directamente vía httpx (sin
+# SDK nuevo). Sin REMOTE_LLM_API_KEY, generate_trade_memo no hace nada
+# (no falla) aunque USE_REMOTE_LLM=true — mismo criterio que Reddit.
+REMOTE_LLM_API_KEY=
+REMOTE_LLM_MODEL=claude-haiku-4-5-20251001
 ```
 
 ## Apéndice B — Qué NO hacer (resumen de trampas conocidas)

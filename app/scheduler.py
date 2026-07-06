@@ -1,10 +1,14 @@
 """APScheduler in-process (sección 5: sin Celery, sin colas externas —
-swing corto no las necesita). Tres jobs independientes, cada uno con su
-propio dominio de fallo:
+swing corto no las necesita). Jobs independientes, cada uno con su propio
+dominio de fallo:
 - `market_cycle_job`, cada `SCAN_INTERVAL_MINUTES`: ingesta + scan + paper
   ledger (el core del sistema).
 - `fundamental_ingest_job`, misma cadencia: ingesta RSS/JSON al almacén
   PIT (sección 12.2) — un fallo aquí no debe tumbar el ciclo técnico.
+- `fundamental_classify_job`, misma cadencia: clasificador Ollama
+  (sección 12.3) sobre los items del PIT sin clasificar todavía.
+- `classifier_scorecard_job`, cron semanal (lunes 00:05 UTC): evalúa el
+  clasificador contra retornos realizados (sección 12.3/16).
 - `daily_summary_job`, cron 22:00 UTC: resumen diario por Telegram
   (sección 17)."""
 
@@ -21,6 +25,8 @@ from services.data.binance_market_data import BinanceMarketData
 from services.data.persistence import insert_market_snapshots, upsert_asset, upsert_candles
 from services.execution.paper_ledger import update_open_positions
 from services.fundamental import ingest_reddit, ingest_rss
+from services.fundamental.classify import classify_pending_items
+from services.fundamental.scorecard import compute_weekly_scorecard
 from services.reporting.daily_summary import build_daily_summary
 from services.scanner.scanner import run_scan_cycle
 
@@ -104,6 +110,37 @@ async def fundamental_ingest_job() -> None:
         logger.exception("fundamental_ingest.failed")
 
 
+async def fundamental_classify_job() -> None:
+    """Clasificador Ollama (sección 12.3) sobre items del almacén PIT sin
+    clasificar, cada `SCAN_INTERVAL_MINUTES` — job independiente: un
+    Ollama caído/lento no debe afectar a la ingesta ni al ciclo técnico."""
+    settings = get_settings()
+    started_at = datetime.now(tz=UTC)
+    log = logger.bind(job="fundamental_classify", started_at=started_at.isoformat())
+    log.info("job.start")
+    try:
+        async with get_session() as session:
+            counts = await classify_pending_items(session, settings, started_at)
+            await session.commit()
+        log.info("job.success", **counts)
+    except Exception:
+        logger.exception("fundamental_classify.failed")
+
+
+async def classifier_scorecard_job() -> None:
+    """Evaluación semanal del clasificador (sección 12.3/16), lunes 00:05
+    UTC — justo tras medianoche, sin pisar el resumen diario de las
+    22:00."""
+    now = datetime.now(tz=UTC)
+    try:
+        async with get_session() as session:
+            counts = await compute_weekly_scorecard(session, now)
+            await session.commit()
+        logger.info("classifier_scorecard.success", **counts)
+    except Exception:
+        logger.exception("classifier_scorecard.failed")
+
+
 async def daily_summary_job() -> None:
     """Resumen diario por Telegram a las 22:00 UTC (sección 17)."""
     settings = get_settings()
@@ -173,12 +210,32 @@ def start_scheduler() -> AsyncIOScheduler:
         coalesce=True,
     )
     scheduler.add_job(
+        fundamental_classify_job,
+        trigger="interval",
+        minutes=settings.scan_interval_minutes,
+        id="fundamental_classify",
+        next_run_time=datetime.now(tz=UTC),
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
         daily_summary_job,
         trigger="cron",
         hour=22,
         minute=0,
         timezone=UTC,
         id="daily_summary",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        classifier_scorecard_job,
+        trigger="cron",
+        day_of_week="mon",
+        hour=0,
+        minute=5,
+        timezone=UTC,
+        id="classifier_scorecard",
         max_instances=1,
         coalesce=True,
     )

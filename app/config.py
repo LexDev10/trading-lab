@@ -59,6 +59,22 @@ class Settings(BaseSettings):
     # `host.docker.internal` funciona out-of-the-box en Docker Desktop
     # (Windows/Mac); en Linux requiere el `extra_hosts` de docker-compose.yml.
     ollama_host: str = "http://host.docker.internal:11434"
+    # DECISION (2026-07-06): cuántos items sin clasificar procesa como
+    # máximo cada corrida de `fundamental_classify_job`. Cada llamada al
+    # Ollama local tarda ~5-15s (verificado con qwen3.5:9b) — sin límite,
+    # un backlog grande alargaría el job sin cota.
+    fundamental_classify_batch_size: int = 10
+    # DECISION (2026-07-06): sección 12.4 no define cuánto tiempo un
+    # veto permanece "activo" tras clasificarse. 24h es conservador
+    # (bloquea/cierra durante aprox. un día tras el evento) y configurable.
+    fundamental_veto_hours: int = 24
+    # DECISION (2026-07-06, fase 3, sección 13): "un LLM externo (API,
+    # opcional)" redacta el memo del trade, nunca decide. Sin API key ni
+    # `USE_REMOTE_LLM=true`, `generate_trade_memo` no toca la red (mismo
+    # criterio que Reddit/Telegram sin credenciales). Modelo barato/rápido
+    # por defecto — la tarea es redactar un resumen corto, no razonar.
+    remote_llm_api_key: str = ""
+    remote_llm_model: str = "claude-haiku-4-5-20251001"
 
     # --- Reddit OAuth Data API (fase 2, ingesta social — sección 12.2) ---
     reddit_client_id: str = ""

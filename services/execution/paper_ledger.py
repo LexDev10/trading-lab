@@ -41,6 +41,7 @@ from core.schemas.technical import TechnicalSignal
 from db.models import EquitySnapshot, PositionEvent, TradeEntry, TradeExit
 from notifications.telegram import send_message
 from services.data.persistence import get_recent_candles
+from services.fundamental.veto import asset_has_active_veto
 from services.risk.portfolio_state import (
     ENVIRONMENT,
     compute_drawdown_pct,
@@ -148,6 +149,7 @@ def evaluate_exit(
     candles: list[Candle],
     settings: Settings,
     now: datetime,
+    veto_active: bool = False,
 ) -> ExitDecision | None:
     """Vela a vela (ascendente, solo velas CERRADAS con `open_time >
     entry_time`, del mismo timeframe que la señal): ¿toca SL, TP o se
@@ -163,10 +165,24 @@ def evaluate_exit(
     # Binance devuelve (y que la ingesta upsertea) se evaluaba: la
     # invalidación usaba un `close` aún no definitivo (contradice la regla
     # "invalidación por CIERRE") y `exit_time` podía quedar en el futuro
-    # (`close_time` reconstruido = open_time + duración > now)."""
+    # (`close_time` reconstruido = open_time + duración > now).
+
+    `veto_active` (sección 12.4, fase 2): un veto fundamental fresco sobre
+    el activo cierra la posición INMEDIATAMENTE, antes de comprobar
+    SL/TP/invalidación (más urgente que esperar a que toque el stop) — al
+    último close disponible, o `entry_price` si todavía no hay ninguna
+    vela cerrada tras la entrada (mismo fallback que la salida por
+    tiempo). El caller (`update_open_positions`) calcula el flag con
+    `services/fundamental/veto.py::asset_has_active_veto`; el backtest
+    nunca lo activa (la capa fundamental no se backtestea, sección 14)."""
     relevant = [
         c for c in candles if c.open_time > entry.entry_time and c.close_time <= now
     ]
+
+    if veto_active:
+        last_close = relevant[-1].close if relevant else entry.entry_price
+        return ExitDecision(now, last_close, TradeStatus.closed_fundamental_veto.value)
+
     for candle in relevant:
         if candle.low <= entry.sl:
             return ExitDecision(candle.close_time, entry.sl, TradeStatus.closed_sl.value)
@@ -299,7 +315,8 @@ async def update_open_positions(session: AsyncSession, settings: Settings, now: 
         if entry.timeframe is None:
             continue
         candles = await get_recent_candles(session, entry.asset, entry.timeframe, 500)
-        exit_decision = evaluate_exit(entry, candles, settings, now)
+        veto_active = await asset_has_active_veto(session, entry.asset.removesuffix("USDT"), settings, now)
+        exit_decision = evaluate_exit(entry, candles, settings, now, veto_active=veto_active)
         if exit_decision is not None:
             await close_position(session, settings, entry, exit_decision, now)
             counts["closed"] += 1

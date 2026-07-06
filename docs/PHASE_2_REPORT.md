@@ -118,13 +118,12 @@ tenía las credenciales y tenía sentido cerrarlo junto con esto.
   razonamiento, más lento y pensado para lógica/matemáticas, no para
   clasificación simple y frecuente), verificado con `curl` desde dentro
   del contenedor.
-- **Clasificador en sí** (sección 12.3): prompt, JSON Schema estricto,
-  parseo de la respuesta y escritura en `item_classifications` — todavía
-  sin construir.
-- `item_classifications`, `classifier_scorecard`: schema no creado (sin
-  consumidor todavía — se añaden cuando se construya el clasificador).
-- Veto fundamental (`RejectionReason.fundamental_veto`, ya existe el
-  enum) sin ningún emisor todavía — llega junto con el clasificador.
+- ~~**Clasificador en sí** (sección 12.3)~~ — **hecho el 2026-07-06**,
+  ver "Continuación" al final de este documento y `CHANGELOG.md`.
+- ~~`item_classifications`, `classifier_scorecard`: schema no creado~~ —
+  **hecho el 2026-07-06** (migración `0006_item_classifications.py`).
+- ~~Veto fundamental sin ningún emisor todavía~~ — **hecho el
+  2026-07-06**, integrado en el risk engine y en el paper ledger.
 
 ## Tests
 
@@ -211,3 +210,87 @@ mensajes de halt/rearme. `social_items` se queda vacía hasta que el
 usuario complete el registro de desarrollador de Reddit y rellene
 `REDDIT_CLIENT_ID`/`SECRET` — el log de `fundamental_ingest_job` no debe
 mostrar ninguna excepción por eso (no-op silencioso, confirmado).
+
+---
+
+## Continuación (2026-07-06): clasificador Ollama + veto + scorecard
+
+**Decisión del usuario** que motiva esta sesión: seguir con Fase 2 hoy
+(clasificador Ollama, no depende de Reddit) y dejar Fase 3/dashboard
+para después de cerrar Fase 2 — otra vez, decisión explícita de no
+adelantar fases. Las credenciales de Reddit las da el usuario más
+adelante.
+
+Con esto, Fase 2 queda **casi cerrada**: solo falta que el usuario
+rellene `REDDIT_CLIENT_ID`/`SECRET` (bloqueante externo, no de código,
+igual que en la sesión anterior).
+
+### Qué se hizo
+
+Detalle técnico completo en `CHANGELOG.md` (entrada 2026-07-06,
+"Fase 2: clasificador Ollama + veto fundamental + scorecard semanal").
+Resumen:
+
+- **Esquema**: migración `0006_item_classifications.py` —
+  `item_classifications` (con `asset_tags` desnormalizado, `# DECISION`
+  fuera del schema sketch de la sección 12.1 para evitar un JOIN
+  polimórfico en cada ciclo del scanner) y `classifier_scorecard`.
+- **Clasificador** (`services/fundamental/classify.py`): llama a Ollama
+  con `format: "json"` (no el JSON Schema estricto — no funciona con
+  `qwen3.5:9b` en la versión de Ollama del usuario, ver `# DECISION` en
+  el código y en `CHANGELOG.md`) y valida la respuesta con Pydantic,
+  fail-closed por item.
+- **Veto fundamental** (sección 12.4): un único punto de verdad
+  (`services/fundamental/veto.py::asset_has_active_veto`) que bloquea
+  entradas nuevas (`services/risk/engine.py`) y cierra posiciones
+  abiertas (`services/execution/paper_ledger.py`, nuevo
+  `TradeStatus.closed_fundamental_veto`).
+- **Scorecard semanal** (`services/fundamental/scorecard.py`): hit-rate
+  y retorno firmado por `(stance, horizon)`, cron lunes 00:05 UTC.
+- Dos jobs nuevos en `app/scheduler.py`.
+
+### Verificación en producción (no solo tests)
+
+Con el stack ya corriendo en background durante la sesión, el
+scheduler ejecutó `fundamental_classify_job` de verdad contra el Ollama
+real del usuario: **47 noticias reales clasificadas**, incluida una
+sobre el desplome del 73% de una empresa con reservas en AVAX,
+correctamente marcada `bearish_strong`/`veto=true`. Confirmado con
+`asset_has_active_veto` que AVAX queda bloqueado ahora mismo — el
+sistema completo (ingesta → clasificación → veto → risk engine)
+funciona de punta a punta con datos reales, no solo en tests con mocks.
+
+### Hallazgo: los tests de integración pueden contaminar datos reales
+
+Mismo patrón que el incidente ya documentado arriba (paper ledger
+operando solo en background): la primera versión de
+`tests/integration/test_classify.py` llamaba a `classify_pending_items`
+con el `batch_size` de producción (10) contra el Postgres COMPARTIDO con
+la app real — **contaminó 9 noticias reales** con la respuesta fake del
+mock antes de que se detectara y limpiara a mano. Corregido: los tests
+fuerzan `fundamental_classify_batch_size=1` y usan un `fetched_at` muy
+anterior a cualquier dato real, para garantizar que el item de test es
+siempre el único elegido. Lección para cualquier test de integración
+futuro que llame a una función de "procesar lo pendiente" sobre una
+tabla compartida con la app real: acotar el batch explícitamente, no
+asumir que el dataset de test está aislado.
+
+### Qué queda fuera todavía
+
+- Reddit: bloqueado por el registro de desarrollador (usuario, no
+  código) — igual que antes.
+- El scorecard semanal está vacío hasta que se acumulen semanas de
+  clasificaciones (recién construido).
+- No se ha probado el "cierre anticipado por veto" con una posición de
+  papel real abierta en producción (sí con tests unitarios/integración);
+  se validará cuando el sistema abra una posición nueva y aparezca un
+  veto mientras está abierta.
+
+### Tests
+
+93 unit + 13 integración en verde (`test_classify.py`,
+`test_scorecard.py`, `test_veto.py` nuevos; casos nuevos en
+`test_risk_engine.py`/`test_paper_ledger.py`). `mypy` sin categorías de
+error nuevas frente al baseline del fix del bug #4 (167→225 líneas,
+todas del mismo patrón de deuda preexistente en tests, más dos errores
+reales corregidos en `classify.py`).

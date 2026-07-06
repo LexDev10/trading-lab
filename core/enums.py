@@ -81,6 +81,9 @@ class TradeStatus(str, Enum):
     closed_manual = "closed_manual"
     closed_invalidated = "closed_invalidated"
     closed_time = "closed_time"
+    # Valor corto a propósito: trade_entries.status/trade_exits.exit_type
+    # son String(20) — "closed_fundamental_veto" (24 chars) no entra.
+    closed_fundamental_veto = "closed_veto"
     error = "error"
 
 

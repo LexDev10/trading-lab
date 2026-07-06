@@ -1,12 +1,14 @@
-"""FastAPI: /health (dashboard llega en fase 3)."""
+"""FastAPI: /health y /dashboard (sección 4/19, fase 3)."""
 
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 from sqlalchemy import select
 
 from app.config import get_settings
+from app.dashboard import render_dashboard
 from app.scheduler import start_scheduler
 from core.git_info import get_git_sha
 from core.logging import configure_logging, get_logger
@@ -61,3 +63,9 @@ async def health() -> dict:
         "system_state": system_state,
         "git_sha": get_git_sha(),
     }
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard() -> str:
+    async with get_session() as session:
+        return await render_dashboard(session)

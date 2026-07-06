@@ -22,6 +22,7 @@ credenciales).
 import argparse
 import asyncio
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 from sqlalchemy import func, select
 
@@ -167,11 +168,29 @@ async def analiza(asset: str, operar: bool) -> None:
                 print(f"  rr_net_of_fees={risk_verdict.rr_net_of_fees}")
                 print(f"  size_quote={risk_verdict.size_quote}")
 
+            if evaluation.policy_outcome is not None:
+                print(
+                    f"\nMeta-decider (MODE={settings.mode}): stance="
+                    f"{evaluation.fundamental_stance.value if evaluation.fundamental_stance else '?'} "
+                    f"-> {evaluation.policy_outcome.action} "
+                    f"(size x{evaluation.policy_outcome.size_multiplier})"
+                )
+
         # --- Decisión final ---
         mode = "operate" if operar else "informe"
-        final_action, would_enter_no_executor = decide_final_action(mode, technical_signal, risk_verdict)
+        final_action, would_enter_no_executor = decide_final_action(
+            mode, technical_signal, risk_verdict, evaluation.policy_outcome
+        )
         if would_enter_no_executor:
             final_action = FinalAction.enter
+
+        decision_payload = None
+        if evaluation.policy_outcome is not None:
+            decision_payload = {
+                "fundamental_stance": evaluation.fundamental_stance.value if evaluation.fundamental_stance else None,
+                "policy_action": evaluation.policy_outcome.action,
+                "size_multiplier": str(evaluation.policy_outcome.size_multiplier),
+            }
 
         record = DecisionRecord(
             ts=now,
@@ -181,6 +200,7 @@ async def analiza(asset: str, operar: bool) -> None:
             git_sha=get_git_sha(),
             scanner=evaluation.scanner_payload,
             technical=technical_signal.model_dump(mode="json") if technical_signal else None,
+            decision=decision_payload,
             risk_verdict=risk_verdict.model_dump(mode="json") if risk_verdict else None,
             final_action=final_action,
             rejection_reasons=evaluation.rejection_reasons,
@@ -192,6 +212,13 @@ async def analiza(asset: str, operar: bool) -> None:
 
         if would_enter_no_executor:
             assert technical_signal is not None and risk_verdict is not None and evaluation.entry_price is not None
+            risk_verdict_for_entry = risk_verdict
+            outcome = evaluation.policy_outcome
+            if outcome is not None and outcome.action == "enter" and outcome.size_multiplier != Decimal("1"):
+                assert risk_verdict_for_entry.size_quote is not None
+                risk_verdict_for_entry = risk_verdict_for_entry.model_copy(
+                    update={"size_quote": risk_verdict_for_entry.size_quote * outcome.size_multiplier}
+                )
             await paper_ledger.open_position(
                 session,
                 settings,

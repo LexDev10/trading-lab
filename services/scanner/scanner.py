@@ -21,7 +21,7 @@ import pandas as pd
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from core.enums import FinalAction, RejectionReason, Trigger
+from core.enums import FinalAction, FundamentalStance, RejectionReason, Trigger
 from core.enums import Regime
 from core.git_info import get_git_sha
 from core.logging import get_logger
@@ -31,9 +31,13 @@ from core.schemas.risk import RiskVerdict
 from core.schemas.technical import TechnicalSignal
 from db.models import RegimeLog
 from journal.decision_logger import log_decision
+from notifications.telegram import send_message
 from services.data.binance_market_data import BinanceMarketData
 from services.data.persistence import get_latest_snapshot, get_recent_candles
+from services.decision.policy import PolicyOutcome, apply_fundamental_policy
 from services.execution import paper_ledger
+from services.fundamental.veto import asset_has_active_veto, get_latest_stance
+from services.reporting.llm_memo import generate_trade_memo
 from services.risk.engine import RiskInput, evaluate_risk
 from services.risk.portfolio_state import build_portfolio_snapshot
 from services.scanner.filters import run_hard_filters
@@ -54,6 +58,8 @@ class AssetEvaluation:
     risk_verdict: RiskVerdict | None
     rejection_reasons: list[RejectionReason] = field(default_factory=list)
     entry_price: Decimal | None = None
+    fundamental_stance: FundamentalStance | None = None
+    policy_outcome: PolicyOutcome | None = None
 
 
 def _jsonable_breakout(detection: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -120,6 +126,8 @@ async def evaluate_asset(
     technical_signal: TechnicalSignal | None = None
     risk_verdict: RiskVerdict | None = None
     entry_price: Decimal | None = None
+    fundamental_stance: FundamentalStance | None = None
+    policy_outcome: PolicyOutcome | None = None
     rejection_reasons: list[RejectionReason] = list(hard_filters.rejection_reasons)
 
     if hard_filters.passed:
@@ -135,6 +143,8 @@ async def evaluate_asset(
             entry_price = entry_ref
             min_notional = await asyncio.to_thread(client.get_min_notional, asset)
             portfolio = await build_portfolio_snapshot(session, settings, asset, now)
+            asset_base = asset.removesuffix("USDT")
+            fundamental_veto_active = await asset_has_active_veto(session, asset_base, settings, now)
 
             risk_verdict = evaluate_risk(
                 RiskInput(
@@ -146,11 +156,21 @@ async def evaluate_asset(
                     spread_bps=snapshot.spread_bps,
                     min_notional=min_notional,
                     regime_blocks_entries=regime_blocks,
+                    fundamental_veto_active=fundamental_veto_active,
                 ),
                 portfolio,
                 settings,
             )
             rejection_reasons.extend(risk_verdict.rejection_reasons)
+
+            # Meta-decider (sección 13, fase 3): solo se consulta si el modo
+            # de ablación lo pide y el risk engine/veto ya aprobó — ver
+            # `services/decision/policy.py` para el porqué de este orden.
+            if settings.mode != "technical_only":
+                fundamental_stance = await get_latest_stance(session, asset_base, settings, now)
+                policy_outcome = apply_fundamental_policy(
+                    settings.mode, technical_signal.conviction, risk_verdict.approved, fundamental_stance
+                )
 
     return AssetEvaluation(
         scanner_payload=scanner_payload,
@@ -158,6 +178,8 @@ async def evaluate_asset(
         risk_verdict=risk_verdict,
         rejection_reasons=rejection_reasons,
         entry_price=entry_price,
+        fundamental_stance=fundamental_stance,
+        policy_outcome=policy_outcome,
     )
 
 
@@ -165,14 +187,26 @@ def decide_final_action(
     mode: Literal["informe", "operate"],
     technical_signal: TechnicalSignal | None,
     risk_verdict: RiskVerdict | None,
+    policy_outcome: PolicyOutcome | None = None,
 ) -> tuple[FinalAction, bool]:
     """`would_enter_no_executor`: True si el risk engine aprobaría la
     entrada pero el executor (sección 10) todavía no existe en este
-    build — fail-closed, nunca se envía una orden real."""
+    build — fail-closed, nunca se envía una orden real.
+
+    `mode` aquí es el "informe"/"operate" de `/analiza` — NO confundir
+    con `settings.mode` (los 3 modos de ablación técnico/fundamental de
+    la sección 13, ya resueltos en `policy_outcome` antes de llegar
+    aquí). `policy_outcome=None` (default) preserva el comportamiento de
+    antes de fase 3 (solo técnico + risk engine)."""
     if mode == "informe":
         return FinalAction.watchlist, False
     if technical_signal is None or risk_verdict is None or not risk_verdict.approved:
         return FinalAction.reject, False
+    if policy_outcome is not None:
+        if policy_outcome.action == "reject":
+            return FinalAction.reject, False
+        if policy_outcome.action == "watchlist":
+            return FinalAction.watchlist, False
     # DECISION: el executor (OCO en testnet) todavía no está implementado.
     return FinalAction.watchlist, True
 
@@ -236,7 +270,7 @@ async def run_scan_cycle(session: AsyncSession, settings: Settings, now: datetim
         )
 
         final_action, would_enter_no_executor = decide_final_action(
-            "operate", evaluation.technical_signal, evaluation.risk_verdict
+            "operate", evaluation.technical_signal, evaluation.risk_verdict, evaluation.policy_outcome
         )
         if would_enter_no_executor:
             final_action = FinalAction.enter
@@ -247,6 +281,13 @@ async def run_scan_cycle(session: AsyncSession, settings: Settings, now: datetim
             counts["watchlist_no_signal"] += 1
 
         technical_signal = evaluation.technical_signal
+        decision_payload: dict[str, Any] | None = None
+        if evaluation.policy_outcome is not None:
+            decision_payload = {
+                "fundamental_stance": evaluation.fundamental_stance.value if evaluation.fundamental_stance else None,
+                "policy_action": evaluation.policy_outcome.action,
+                "size_multiplier": str(evaluation.policy_outcome.size_multiplier),
+            }
         record = DecisionRecord(
             ts=now,
             mode=settings.mode,
@@ -255,6 +296,7 @@ async def run_scan_cycle(session: AsyncSession, settings: Settings, now: datetim
             git_sha=git_sha,
             scanner=evaluation.scanner_payload,
             technical=technical_signal.model_dump(mode="json") if technical_signal else None,
+            decision=decision_payload,
             risk_verdict=evaluation.risk_verdict.model_dump(mode="json") if evaluation.risk_verdict else None,
             final_action=final_action,
             rejection_reasons=evaluation.rejection_reasons,
@@ -266,17 +308,40 @@ async def run_scan_cycle(session: AsyncSession, settings: Settings, now: datetim
 
         if would_enter_no_executor:
             assert technical_signal is not None and evaluation.risk_verdict is not None and evaluation.entry_price is not None
+            risk_verdict_for_entry = evaluation.risk_verdict
+            outcome = evaluation.policy_outcome
+            if outcome is not None and outcome.action == "enter" and outcome.size_multiplier != Decimal("1"):
+                assert risk_verdict_for_entry.size_quote is not None
+                risk_verdict_for_entry = risk_verdict_for_entry.model_copy(
+                    update={"size_quote": risk_verdict_for_entry.size_quote * outcome.size_multiplier}
+                )
             await paper_ledger.open_position(
                 session,
                 settings,
                 decision_log_id=decision_log_id,
                 asset=asset,
                 technical_signal=technical_signal,
-                risk_verdict=evaluation.risk_verdict,
+                risk_verdict=risk_verdict_for_entry,
                 entry_price=evaluation.entry_price,
                 now=now,
             )
             log.info("cycle.paper_open", asset=asset, decision_log_id=decision_log_id)
+
+            # Memo LLM opcional (sección 13) — solo en modo "full", y solo
+            # redacta, nunca decide (la posición ya se abrió arriba). No-op
+            # sin USE_REMOTE_LLM/API key (ver services/reporting/llm_memo.py).
+            if settings.mode == "full":
+                memo = await generate_trade_memo(
+                    settings,
+                    {
+                        "asset": asset,
+                        "technical": technical_signal.model_dump(mode="json"),
+                        "decision": decision_payload,
+                        "risk_verdict": risk_verdict_for_entry.model_dump(mode="json"),
+                    },
+                )
+                if memo is not None:
+                    await send_message(settings, f"📝 <b>Memo</b> {asset}\n{memo}")
 
     log.info("cycle.success", **counts)
     return counts

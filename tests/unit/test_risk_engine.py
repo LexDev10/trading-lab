@@ -64,6 +64,12 @@ def test_baseline_all_checks_pass_and_approved():
             RejectionReason.regime_filter,
         ),
         (
+            "fundamental_veto",
+            lambda ri: dataclasses.replace(ri, fundamental_veto_active=True),
+            lambda p: p,
+            RejectionReason.fundamental_veto,
+        ),
+        (
             "rr_net",
             lambda ri: dataclasses.replace(ri, take_profit=Decimal("103")),
             lambda p: p,

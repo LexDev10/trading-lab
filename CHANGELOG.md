@@ -5,6 +5,156 @@ Registro cronológico de lo implementado en el proyecto. Formato:
 
 ## 2026-07-06
 
+- **[2026-07-06]** **Fase 3 (en progreso): meta-decider + dashboard +
+  memo LLM opcional** (sección 13/4/19).
+  - **Tabla de política** (`services/decision/policy.py`, paquete
+    nuevo): fusión determinista técnico×fundamental literal de la
+    sección 13, un único archivo legible (`POLICY_TABLE`). La fila
+    "veto" de la tabla original se omite a propósito: ya la cubre el
+    risk engine desde fase 2 (`checks["fundamental_veto"]`) — repetirla
+    aquí sería una segunda implementación del mismo check.
+    `evaluate_policy(conviction, stance)` cubre los 18 pares posibles
+    (incluido `moderate`+`bullish_weak`, no cubierto explícitamente por
+    la tabla de ejemplo del spec → watchlist, `# DECISION`).
+  - **`# DECISION` importante**: el veto fundamental (fase 2) sigue
+    aplicando SIEMPRE, independientemente de `MODE` — es una salvaguarda
+    de riesgo (hackeos, delistings), no parte de la ablación. Solo la
+    tabla de política (la pieza nueva) se gatea por
+    `MODE != technical_only`. Confirmado con el usuario: ablación
+    "solo-modo-activo" esta ronda (sin shadow-mode — no se evalúan los 3
+    modos en paralelo sobre la misma señal).
+  - `services/fundamental/veto.py::get_latest_stance`: misma ventana de
+    frescura que `asset_has_active_veto` (`fundamental_veto_hours`).
+    **Bug encontrado y corregido durante los tests**: ni esta función ni
+    `asset_has_active_veto` acotaban `classified_at <= now` (solo el
+    límite inferior de la ventana) — sin este límite superior, una
+    clasificación posterior a `now` (datos de otra ventana temporal,
+    jobs retrasados) contaba como ya conocida en el momento de la
+    decisión, violando el principio anti look-ahead que ya aplica en
+    todo el resto del sistema (sección 12.1). Corregido en ambas
+    funciones.
+  - **Enganche en `services/scanner/scanner.py`**: nuevo
+    `apply_fundamental_policy` (`None` si `MODE=technical_only` o si el
+    risk engine no aprobó). `decide_final_action` (compartida con
+    `scripts/analiza.py`, sección 6) gana un `policy_outcome` opcional
+    con default `None` — compatibilidad total con el comportamiento
+    anterior. Un `size_multiplier` != 1 se aplica copiando el
+    `RiskVerdict` (`model_copy`) antes de `paper_ledger.open_position`,
+    sin tocar su firma. El resultado de la fusión (`stance`,
+    `policy_action`, `size_multiplier`) se guarda en
+    `DecisionRecord.decision` — campo del schema que existía desde fase
+    1 sin usarse nunca hasta ahora.
+  - **Memo LLM opcional** (`services/reporting/llm_memo.py`): llama a la
+    API de mensajes de Anthropic vía `httpx` (sin SDK nuevo, mismo
+    criterio que Ollama). `USE_REMOTE_LLM=false`/sin
+    `REMOTE_LLM_API_KEY` por defecto — no toca la red (mismo patrón que
+    Reddit/Telegram). Se dispara solo en `MODE=full` al abrir una
+    posición, y se envía por Telegram como mensaje aparte.
+  - **Dashboard mínimo** (`GET /dashboard`, `app/dashboard.py` +
+    `services/reporting/dashboard_data.py`): página HTML autocontenida
+    (Chart.js por CDN, sin plantillas ni dependencias Python nuevas) con
+    curva de equity, resumen de trading, decisiones por modo de
+    ablación y últimas decisiones. Refactor sin cambio de comportamiento:
+    la fórmula de win_rate/profit_factor de `scripts/estado.py` se
+    extrajo a `compute_closed_trades_summary` (una sola fuente de
+    verdad, reutilizada por ambos).
+  - **Verificado con datos reales de producción**: `get_latest_stance`/
+    `asset_has_active_veto` contra una clasificación real (una noticia
+    sobre el desplome del 73% de una empresa con reservas en AVAX,
+    `bearish_strong`/`veto=true`) — con `MODE=technical_plus_fundamental`
+    y `conviction=strong` hipotético, la tabla de política devuelve
+    `reject`, exactamente la fila de la sección 13. El endpoint
+    `/dashboard` renderiza con datos reales de producción (690+
+    decisiones ya registradas hoy).
+  - Tests nuevos: `test_policy.py`, `test_scanner.py`, `test_llm_memo.py`
+    (unit); `test_dashboard_data.py`, extensión de `test_veto.py`
+    (integración, con el mismo criterio de asserts-por-delta que
+    `test_daily_summary.py` — Postgres compartido con la app real en
+    background). 122 unit + 21 integración en verde; `mypy` sin
+    categorías de error nuevas (solo deuda preexistente en los propios
+    tests nuevos).
+  - **Pendiente para cerrar Fase 3**: probar el memo LLM contra la API
+    real de Anthropic (solo verificado con mocks); confirmar en
+    producción un `size_multiplier` aplicado de verdad al abrir una
+    posición (todavía no ha coincidido una señal real con
+    `MODE!=technical_only`, ya que `technical_only` sigue siendo el
+    modo por defecto).
+
+- **[2026-07-06]** **Fase 2: clasificador Ollama + veto fundamental +
+  scorecard semanal** (secciones 12.3/12.4/16). Único trabajo que
+  faltaba para cerrar Fase 2 salvo Reddit (bloqueado por credenciales,
+  sin tocar en esta ronda).
+  - **Esquema** (migración `0006_item_classifications.py`):
+    `item_classifications` (sección 12.1 + columna extra `asset_tags`,
+    ver `# DECISION` en la migración — evita un JOIN polimórfico contra
+    `news_items`/`social_items` en cada ciclo del scanner) y
+    `classifier_scorecard` (sección 16).
+  - **Clasificador** (`services/fundamental/classify.py`): prompt en
+    español que enumera los valores válidos de `stance`/`event_types`
+    (`core/enums.py`, sin duplicar la lista), llama a Ollama y valida
+    la respuesta con Pydantic (fail-closed por item si el modelo
+    devuelve algo fuera de esquema — mismo criterio que
+    `ingest_rss.ingest_all` fail-closed por fuente).
+    **`# DECISION`**: el `format` de JSON Schema estricto de Ollama
+    (`format: {...schema...}`) se probó contra el Ollama real del
+    usuario (v0.31.1, `qwen3.5:9b`) y el modelo lo ignora por completo
+    (devuelve prosa libre incluso con `think: false`); `format: "json"`
+    (JSON suelto) sí funciona de forma fiable con un prompt explícito.
+    Se usa JSON suelto + validación Pydantic estricta del lado Python,
+    más robusto que depender de que el grammar-constraint de Ollama
+    funcione para cualquier modelo futuro.
+  - **Veto fundamental** (sección 12.4), un único punto de verdad
+    (`services/fundamental/veto.py::asset_has_active_veto`) reutilizado
+    en dos sitios (regla crítica, sección 6):
+    - Bloquea entradas nuevas: `RiskInput.fundamental_veto_active` →
+      `evaluate_risk` lo trata como un check más
+      (`checks["fundamental_veto"]`), igual que `regime_filter`.
+    - Cierra posiciones abiertas: `paper_ledger.evaluate_exit` gana
+      `veto_active: bool = False` — si es `True`, cierra ANTES de
+      comprobar SL/TP/invalidación, con el nuevo
+      `TradeStatus.closed_fundamental_veto` (valor de enum acortado a
+      `"closed_veto"`: `trade_entries.status`/`trade_exits.exit_type`
+      son `String(20)`, y el nombre completo no entraba). El backtest
+      nunca activa el flag (la capa fundamental no se backtestea,
+      sección 14).
+  - **Scorecard semanal** (`services/fundamental/scorecard.py`, cron
+    lunes 00:05 UTC): hit-rate y retorno medio FIRMADO por
+    `(stance, horizon)` — `bullish_*` acierta si el retorno futuro > 0,
+    `bearish_*` si es < 0. **`# DECISION`**: `neutral`/`unknown` se
+    excluyen (ninguno hace una predicción direccional que evaluar).
+    Vacío hasta que se acumulen semanas de datos clasificados.
+  - Nuevos jobs en `app/scheduler.py`: `fundamental_classify_job` (misma
+    cadencia que la ingesta) y `classifier_scorecard_job` (semanal).
+  - **Verificado en producción, no solo en tests**: con el clasificador
+    corriendo en vivo contra el Ollama real del usuario, clasificó 47
+    noticias reales ya ingeridas, incluida una noticia real sobre el
+    desplome del 73% de una empresa con reservas en AVAX, correctamente
+    marcada `bearish_strong`/`veto=true` — `asset_has_active_veto`
+    bloquea AVAX en este momento, confirmado en vivo.
+  - **Hallazgo de la sesión (mismo patrón que el incidente ya
+    documentado con el paper ledger en `docs/PHASE_2_REPORT.md`)**: los
+    tests de integración corren contra el MISMO Postgres que usa la app
+    real en background. La primera versión de
+    `tests/integration/test_classify.py` usaba el `batch_size` por
+    defecto (10) y **contaminó 9 noticias reales** con la respuesta fake
+    del mock (limpiado a mano). Corregido: los tests fuerzan
+    `fundamental_classify_batch_size=1` y usan un `fetched_at` muy
+    anterior a cualquier dato real, para que el item de test sea siempre
+    el único elegido (`_pending_news` ordena por `fetched_at`
+    ascendente). El test de idempotencia tampoco vuelve a llamar a
+    `classify_pending_items` una segunda vez (con backlog real
+    compartido, una segunda pasada siempre encuentra ALGO que
+    clasificar) — verifica en su lugar que `_pending_news` excluye el
+    item ya clasificado.
+  - Tests: `test_classify.py` (unit + integración), caso nuevo
+    `fundamental_veto` en `test_risk_engine.py`, casos nuevos de
+    `veto_active` en `test_paper_ledger.py`, `test_scorecard.py` (unit +
+    integración), `test_veto.py` (integración). 93 unit + 13 integración
+    en verde; `mypy` sin categorías de error nuevas frente al baseline
+    del fix del bug #4 (solo la misma deuda preexistente de tests, más
+    dos errores reales corregidos: una variable de bucle reutilizada
+    con tipos incompatibles en `classify.py`).
+
 - **[2026-07-06]** **Bug #4 corregido: divergencia backtest/paper en las
   SALIDAS** (prioridad alta, sección 6 — "divergencia backtest/live es
   un bug de primera clase"). El backtest (`backtests/
