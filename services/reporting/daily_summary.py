@@ -17,11 +17,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings
 from db.models import DecisionLog, TradeEntry, TradeExit
 from services.data.persistence import get_recent_candles
-from services.risk.portfolio_state import build_portfolio_snapshot
+from services.risk.portfolio_state import ENVIRONMENT, build_portfolio_snapshot
 from services.scanner.regime import compute_btc_regime
 from services.technical.indicators import candles_to_frame
-
-ENVIRONMENT = "paper"
 
 
 async def _trades_today(session: AsyncSession, day_start: datetime) -> tuple[int, Decimal]:

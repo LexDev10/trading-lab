@@ -3,7 +3,8 @@ equity/drawdown (`portfolio_state`), trades del día (`trade_exits`) y
 rechazos por motivo (`decision_logs.rejection_reasons`) — sección 17.
 
 `equity_snapshots` no tiene FK a nada (es un rollup puntual, sección 16),
-así que "última equity" se decide por `ts` más reciente sobre TODA la
+así que "última equity" se decide por la última fila insertada (`id`, ver
+FIX 2026-07-06 en `portfolio_state.py`; antes era por `ts`) sobre TODA la
 tabla `environment='paper'`. Para que la fila de este test sea de verdad
 "la última" — sin importar qué datos reales de paper trading existan ya
 en la DB — se siembra con `ts = now()` real (capturado al arrancar el

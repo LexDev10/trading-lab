@@ -71,11 +71,16 @@ on-demand, sección 21.3) y rechaza stablecoins con un mensaje explicativo
 Cuando el risk engine aprueba una entrada (ciclo automático o `/analiza
 ... operar`), el sistema abre una posición de **papel**: simulación sobre
 velas reales ya ingeridas, sin llamar a ningún exchange
-(`services/execution/paper_ledger.py`). Se sigue vela a vela hasta SL, TP,
-invalidación técnica o expiración por horizonte, con fee simulada de
-0.1%/lado — sustituto temporal del executor OCO real contra testnet
+(`services/execution/paper_ledger.py`). Se sigue vela a vela (solo velas
+**cerradas**, `close_time <= now` — fix 2026-07-06, ver CHANGELOG) hasta
+SL, TP, invalidación técnica o expiración por horizonte, con fee simulada
+de 0.1%/lado — sustituto temporal del executor OCO real contra testnet
 mientras no existan credenciales (`# DECISION`, sección 10.1 del
-documento).
+documento). Los snapshots de equity se escriben con el tiempo de proceso
+y se leen por orden de inserción, filtrados por `environment='paper'`
+(fixes 2026-07-06: antes, cierres procesados fuera de orden cronológico
+podían perder PnL de la curva de equity, y filas de otros environments
+contaminaban los checks de cartera).
 
 ```bash
 docker compose exec app uv run python -m scripts.estado
@@ -219,6 +224,28 @@ docker compose exec app uv run alembic upgrade head
 - El backtest testea cada timeframe (1h/4h) de forma independiente y
   compone los trades out-of-sample de forma secuencial (no simula cartera
   multi-posición real) — limitaciones completas en `backtests/RESULTS.md`.
+- **Divergencia backtest/paper en las SALIDAS — corregida el 2026-07-06**:
+  el backtest ahora reutiliza literalmente `paper_ledger.evaluate_exit`
+  (`backtests/strategy_breakout.py::simulate_trades`) para decidir
+  invalidación técnica y salida por tiempo, no solo SL/TP. Los números
+  de `backtests/RESULTS.md` están recalculados con el motor corregido
+  (expectancy positiva pero más modesta que antes del fix — ver ese
+  documento). **Residual sin cubrir**: el backtest sigue sin aplicar el
+  filtro de régimen BTC ni los filtros duros del scanner (liquidez/
+  spread/frescura) — necesitarían histórico de `market_snapshots`, que
+  hoy no se persiste para backtest; su ausencia probablemente
+  sobreestima el número de trades reales. Tampoco se ha tocado el risk
+  engine: `rr_net >= MIN_RR_NET` (`services/risk/engine.py`) se sigue
+  calculando contra el SL, no contra la invalidación (la salida más
+  frecuente en la práctica) — sin decidir todavía si merece la pena
+  cambiarlo.
+- Detalles menores conocidos del paper ledger / backtest (revisión
+  2026-07-06, aceptados por ahora): la vela en la que ocurre la entrada
+  queda excluida del seguimiento (hasta 4h sin vigilar SL/TP); una salida
+  por gap se registra al precio exacto del SL (optimista); las ventanas
+  IS/OOS del walk-forward comparten 1 vela de frontera (`df.loc`
+  inclusivo); la frescura de datos del scanner solo se comprueba sobre
+  velas 1h.
 - Fase 2 (capa fundamental) está solo arrancada: hay almacén PIT + ingesta
   RSS/JSON + Reddit, y ya está resuelta la conectividad con Ollama (host
   del usuario, ver arriba) — pero `REDDIT_CLIENT_ID`/`SECRET` siguen

@@ -17,9 +17,10 @@ from datetime import datetime
 
 import pandas as pd
 
-from app.config import get_settings
-from backtests.strategy_breakout import DEFAULT_FEES, DEFAULT_SLIPPAGE, generate_signals, run_portfolio
+from app.config import Settings, get_settings
+from backtests.strategy_breakout import DEFAULT_SLIPPAGE, simulate_trades
 from core.git_info import get_git_sha
+from core.schemas.market import Timeframe
 from db.session import get_session
 from services.data.persistence import get_all_candles
 
@@ -29,7 +30,7 @@ IN_SAMPLE_MONTHS = 6
 OUT_SAMPLE_MONTHS = 2
 MIN_CANDLES_FOR_FOLD = 60  # margen sobre el lookback/volumen máximos del grid
 
-TIMEFRAMES = ("1h", "4h")
+TIMEFRAMES: tuple[Timeframe, ...] = ("1h", "4h")
 
 
 @dataclass
@@ -64,10 +65,13 @@ def _candles_to_indexed_frame(candles) -> pd.DataFrame:
     rows = [
         {
             "open_time": c.open_time,
+            "close_time": c.close_time,
+            "open": float(c.open),
             "high": float(c.high),
             "low": float(c.low),
             "close": float(c.close),
             "volume": float(c.volume),
+            "quote_volume": float(c.quote_volume),
         }
         for c in candles
     ]
@@ -87,37 +91,40 @@ def _expectancy(returns: pd.Series) -> float:
     return win_rate * avg_win - loss_rate * avg_loss
 
 
-def _run_trades(df_window: pd.DataFrame, lookback: int, volume_mult: float) -> pd.DataFrame:
-    """Devuelve los trades de vectorbt con una columna añadida
+def _run_trades(
+    df_window: pd.DataFrame,
+    lookback: int,
+    volume_mult: float,
+    settings: Settings,
+    asset: str,
+    timeframe: Timeframe,
+) -> pd.DataFrame:
+    """Trades simulados con salidas realistas (SL/TP/invalidación/tiempo,
+    ver `simulate_trades` — bug #4 del CHANGELOG). Ya trae
     `sl_pct_at_entry`, necesaria para traducir el retorno del INSTRUMENTO
-    (lo que da vectorbt) al retorno del EQUITY TOTAL con sizing real
-    (riesgo fijo fraccional, sección 9.3) — ver `_equity_impact`."""
+    al retorno del EQUITY TOTAL con sizing real (riesgo fijo fraccional,
+    sección 9.3) — ver `_equity_impact`."""
     if len(df_window) < MIN_CANDLES_FOR_FOLD:
         return pd.DataFrame()
-    signals = generate_signals(df_window, lookback, volume_mult)
-    pf = run_portfolio(df_window, lookback, volume_mult, fees=DEFAULT_FEES, slippage=DEFAULT_SLIPPAGE)
-    trades = pf.trades.records_readable
-    if len(trades) == 0:
-        return trades
-    trades = trades.copy()
-    trades["sl_pct_at_entry"] = trades["Entry Timestamp"].map(signals["sl_pct"])
-    return trades
+    return simulate_trades(df_window, lookback, volume_mult, settings, asset, timeframe, slippage=DEFAULT_SLIPPAGE)
 
 
 def _equity_impact(trades: pd.DataFrame, risk_per_trade: float) -> pd.Series:
     """Fracción de equity TOTAL ganada/perdida por trade, asumiendo que
     CADA trade se dimensiona para arriesgar exactamente `risk_per_trade`
     del equity si toca el stop (sección 9.3: `size_quote = equity ×
-    RISK_PER_TRADE / distancia_relativa_al_SL`). El `Return` que da
-    vectorbt es el retorno del INSTRUMENTO (asume invertir ~todo el
-    capital); aquí se re-escala a lo que de verdad movería la cuenta con
-    el sizing real del sistema."""
+    RISK_PER_TRADE / distancia_relativa_al_SL`). El `Return` de
+    `simulate_trades` es el retorno del INSTRUMENTO (asume invertir ~todo
+    el capital); aquí se re-escala a lo que de verdad movería la cuenta
+    con el sizing real del sistema."""
     if len(trades) == 0:
         return pd.Series(dtype=float)
     return trades["Return"] * (risk_per_trade / trades["sl_pct_at_entry"])
 
 
-def walk_forward_asset(df: pd.DataFrame, asset: str, timeframe: str, risk_per_trade: float) -> WalkForwardResult:
+def walk_forward_asset(
+    df: pd.DataFrame, asset: str, timeframe: Timeframe, risk_per_trade: float, settings: Settings
+) -> WalkForwardResult:
     result = WalkForwardResult()
     if len(df) == 0:
         return result
@@ -137,7 +144,7 @@ def walk_forward_asset(df: pd.DataFrame, asset: str, timeframe: str, risk_per_tr
 
         best: tuple[float, int, float, int] | None = None  # (expectancy, lookback, vol_mult, n_trades)
         for lookback, vol_mult in itertools.product(LOOKBACK_GRID, VOLUME_MULT_GRID):
-            trades = _run_trades(is_df, lookback, vol_mult)
+            trades = _run_trades(is_df, lookback, vol_mult, settings, asset, timeframe)
             if len(trades) == 0:
                 continue
             # Selección de parámetros in-sample por expectancy en términos
@@ -154,7 +161,7 @@ def walk_forward_asset(df: pd.DataFrame, asset: str, timeframe: str, risk_per_tr
             continue
 
         _, chosen_lookback, chosen_vol_mult, is_trade_count = best
-        oos_trades = _run_trades(oos_df, chosen_lookback, chosen_vol_mult)
+        oos_trades = _run_trades(oos_df, chosen_lookback, chosen_vol_mult, settings, asset, timeframe)
 
         result.folds.append(
             FoldResult(
@@ -260,7 +267,7 @@ async def run_full_walk_forward() -> dict:
             for timeframe in TIMEFRAMES:
                 candles = await get_all_candles(session, asset, timeframe)
                 df = _candles_to_indexed_frame(candles)
-                fold_result = walk_forward_asset(df, asset, timeframe, risk_per_trade)
+                fold_result = walk_forward_asset(df, asset, timeframe, risk_per_trade, settings)
                 pooled.folds.extend(fold_result.folds)
                 pooled.oos_trades.extend(fold_result.oos_trades)
 
@@ -279,7 +286,7 @@ async def run_full_walk_forward() -> dict:
             "volume_mult_grid": VOLUME_MULT_GRID,
             "in_sample_months": IN_SAMPLE_MONTHS,
             "out_sample_months": OUT_SAMPLE_MONTHS,
-            "fees": DEFAULT_FEES,
+            "fees": str(settings.taker_fee),
             "slippage": DEFAULT_SLIPPAGE,
             "risk_per_trade": risk_per_trade,
             "universe": assets,

@@ -31,7 +31,11 @@ def _classify_conviction(rel_volume: Decimal, volume_confirm_mult: Decimal) -> T
     return TechnicalConviction.moderate
 
 
-def _horizon_for_timeframe(timeframe: Literal["1h", "4h"]) -> HorizonClass:
+def horizon_for_timeframe(timeframe: Literal["1h", "4h"]) -> HorizonClass:
+    """Único mapeo timeframe -> horizonte (sección 7.2). Reutilizado por
+    `backtests/strategy_breakout.py` para construir entradas simuladas con
+    el mismo `horizon_class` que produciría `build_technical_signal` en
+    vivo (regla crítica, sección 6)."""
     return HorizonClass.hours if timeframe == "1h" else HorizonClass.days
 
 
@@ -83,7 +87,7 @@ def build_technical_signal(
         take_profit=take_profit,
         atr_14=atr_14,
         rel_volume=rel_volume,
-        horizon_class=_horizon_for_timeframe(timeframe),
+        horizon_class=horizon_for_timeframe(timeframe),
         invalidation_rule=f"close_{timeframe}_below_{range_high}",
         invalidation_level=range_high,
         evidence={

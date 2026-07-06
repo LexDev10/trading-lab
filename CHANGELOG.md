@@ -3,6 +3,143 @@
 Registro cronológico de lo implementado en el proyecto. Formato:
 `[YYYY-MM-DD HH:MM] Descripción`.
 
+## 2026-07-06
+
+- **[2026-07-06]** **Bug #4 corregido: divergencia backtest/paper en las
+  SALIDAS** (prioridad alta, sección 6 — "divergencia backtest/live es
+  un bug de primera clase"). El backtest (`backtests/
+  strategy_breakout.py`) solo modelaba SL/TP vía
+  `vectorbt.Portfolio.from_signals(sl_stop=..., tp_stop=...)`, ciego a
+  las otras dos salidas que sí aplica `paper_ledger.evaluate_exit`:
+  invalidación técnica (cierre de vela < `range_high` de la señal — la
+  salida más frecuente y mucho más cercana que el SL, porque la entrada
+  queda por encima de ese nivel) y salida por tiempo (horizonte máximo,
+  sección 10.1). `backtests/RESULTS.md` no representaba la operativa
+  real.
+  - **Fix**: `run_portfolio` (vectorbt) se sustituye por
+    `simulate_trades`, que para cada señal llama DIRECTAMENTE a
+    `paper_ledger.evaluate_exit` — mismo código, no una reimplementación
+    — para decidir cuándo y a qué precio sale cada trade. `vectorbt`
+    deja de usarse en la ruta de decisión. Para permitir la reutilización
+    sin acoplar el backtest al ORM: `evaluate_exit` pasa a tipar su
+    parámetro `entry` como un `Protocol` (`PaperEntryLike`) en vez de
+    `TradeEntry`; `_max_hold` se hace pública (`max_hold_for_horizon`); y
+    la aritmética de fees/PnL de `close_position` se extrae a
+    `compute_trade_pnl` (misma fórmula, reutilizada por ambos). También
+    se hace pública `signal_builder._horizon_for_timeframe` →
+    `horizon_for_timeframe`.
+  - Si el horizonte de una señal cae después de la última vela
+    disponible en la ventana simulada, el trade queda sin resolver
+    (censura por límite de datos) y se descarta — de paso resuelve la
+    limitación conocida #9 (trades abiertos al final de la ventana
+    contaminando la expectancy del walk-forward).
+  - El fee del backtest pasa a leerse de `settings.taker_fee` (antes una
+    constante `DEFAULT_FEES` propia e independiente de `settings`, un
+    mini-riesgo de divergencia adicional). El slippage pesimista
+    (`DEFAULT_SLIPPAGE`, 2bps) sigue siendo específico del backtest — el
+    paper ledger no lo necesita porque simula fills contra precios reales
+    de vela, no una ejecución hipotética.
+  - **Resultados recalculados** (`backtests/RESULTS.md`, mismo histórico
+    de 803 días ya en DB, sin necesidad de volver a descargar): 738 trades OOS
+    (antes 322), win rate 28.0% (antes 55.6% — la invalidación corta la
+    mayoría de los trades antes del TP), expectancy neta **+0.096%** por
+    trade (antes +0.327% — sigue siendo positiva, la hipótesis de la
+    sección 3.1 no queda falsada, pero con un margen bastante más
+    estrecho), profit factor 1.99, max drawdown −7.03%.
+  - **Fuera de alcance de este fix** (residual, documentado en
+    `README.md`/`RESULTS.md`): el backtest sigue sin aplicar el filtro de
+    régimen BTC ni los filtros duros del scanner (liquidez/spread/
+    frescura) — requieren histórico de `market_snapshots`, que hoy no se
+    persiste para backtest. Tampoco se ha tocado `rr_net >= MIN_RR_NET`
+    del risk engine (sigue calculándose contra el SL, no contra la
+    invalidación).
+  - Tests: `tests/unit/test_backtest_regression.py` reescrito —
+    `generate_signals` expone ahora precios absolutos
+    (`entry_ref`/`sl`/`tp`/`invalidation_level`); nuevos casos que
+    prueban que `simulate_trades` cierra por invalidación y descarta
+    trades censurados por falta de datos (antes solo se probaba el
+    camino SL/TP). Verificado en Docker: 72 unit + 6 integration pasan;
+    `mypy` no añade categorías de error nuevas (solo el mismo patrón de
+    deuda preexistente en tests: anotaciones de retorno, `_env_file`).
+
+- **[2026-07-06]** **Revisión de código completa: 3 bugs corregidos**
+  (contabilidad de equity, vela en curso en salidas, mezcla de
+  environments) **+ 2 limitaciones documentadas** (divergencia
+  backtest/paper en salidas, detalles menores). Ningún cambio de
+  comportamiento en señales ni en el risk engine aprobando/rechazando —
+  los tres fixes afectan a cómo se persiste/lee el estado del paper
+  ledger.
+  - **Bug 1 — la curva de equity se corrompía con cierres fuera de orden
+    cronológico** (`services/execution/paper_ledger.py::close_position` +
+    `services/risk/portfolio_state.py::get_latest_equity`): el
+    `EquitySnapshot` de un cierre se insertaba con `ts = exit_time` (el
+    close de la vela que disparó la salida, potencialmente horas en el
+    pasado), pero "última equity" se leía por `ts` más reciente. Si en un
+    mismo ciclo se cerraban dos posiciones con `exit_time` no monotónicos
+    (p.ej. A tocó SL a las 14:00 y B a las 10:00, procesadas en ese
+    orden), el snapshot de B quedaba "detrás" del de A y **su PnL
+    desaparecía de la curva de equity** — y con ella del
+    `drawdown_killswitch` y del `daily_loss_limit`. Corregido en dos
+    frentes: el snapshot usa ahora el tiempo de PROCESO (`ts=now`,
+    monotónico; `trade_exits.exit_time` conserva el tiempo de la vela) y
+    la lectura de "última equity" ordena por `id` (orden de inserción) en
+    vez de por `ts` (`get_latest_equity`, `_get_drawdown_pct`,
+    `scripts/estado.py`). `close_position` gana el parámetro `now`.
+  - **Bug 2 — la vela EN CURSO entraba en la evaluación de salidas**
+    (`services/execution/paper_ledger.py::evaluate_exit`): la ingesta
+    upsertea también la kline en formación que devuelve Binance, y
+    `update_open_positions` la pasaba a `evaluate_exit` sin filtrar (a
+    diferencia del scanner, que filtra con `candles_to_frame`). Dos
+    consecuencias: (a) la invalidación técnica usaba un `close` aún no
+    definitivo — un dip intra-vela cerraba la posición como
+    `closed_invalidated` aunque la vela acabara cerrando por encima del
+    nivel, contradiciendo la regla "invalidación por CIERRE" (sección
+    7.2); (b) `exit_time` podía quedar **en el futuro** (`close_time`
+    reconstruido = `open_time` + duración > `now`), escribiendo
+    `trade_exits`/`position_events` con timestamps futuros (y agravando
+    el bug 1). Corregido: `evaluate_exit` solo considera velas con
+    `close_time <= now` — mismo criterio anti look-ahead que
+    `candles_to_frame` (sección 18). SL/TP se siguen evaluando al cierre
+    de cada vela (simplificación ya documentada del paper ledger).
+  - **Bug 3 — el estado de cartera mezclaba environments**
+    (`services/risk/portfolio_state.py`): `get_latest_equity`,
+    `_get_open_positions`, `_get_daily_realized_pnl_pct`,
+    `_get_equity_peak`, `_get_drawdown_pct` y los dos cooldowns no
+    filtraban por `environment`, mientras que el paper ledger escribe
+    `environment='paper'` y `estado`/`daily_summary` sí filtran. Una fila
+    sembrada por un test de integración (`environment='test'`) — o, en el
+    futuro, filas de testnet/live — contaminaba la equity, la exposición
+    y los cooldowns que consume el risk engine. Corregido: TODAS las
+    queries de `portfolio_state` filtran por `ENVIRONMENT` (constante
+    única definida ahí y reutilizada ahora por `paper_ledger`,
+    `daily_summary` y `estado` — antes cada módulo declaraba la suya).
+    `tests/integration/test_killswitch.py` ya no siembra equity con
+    `environment='test'` (era el vector del problema y ya no influye).
+  - Tests: 2 casos unitarios nuevos en `test_paper_ledger.py`
+    (`test_in_progress_candle_is_ignored`,
+    `test_candle_evaluated_once_it_closes`);
+    `tests/integration/test_paper_ledger.py` actualizado a la nueva firma
+    de `close_position`. **Pendiente de ejecutar la suite en el stack**
+    (`docker compose run --rm --no-deps app uv run pytest -v` + la de
+    integración): esta ronda se hizo fuera del entorno Docker (revisión
+    estática + edición), sin Python 3.12 ni Postgres disponibles.
+  - **Limitación documentada (sin fix, README)**: divergencia
+    backtest/paper en las SALIDAS — el backtest vectorbt solo modela
+    SL/TP (`exits=False`), mientras el paper ledger añade invalidación
+    técnica y salida por tiempo. Con `invalidation_level = range_high` y
+    entrada por encima de él, la invalidación es en la práctica la salida
+    más frecuente y mucho más cercana que el SL: los resultados de
+    `backtests/RESULTS.md` no representan la operativa del paper ledger,
+    y el `rr_net >= MIN_RR_NET` del risk engine se calcula contra el SL,
+    no contra la salida realista. Pendiente de decidir: modelar
+    invalidación/tiempo en el backtest o revisar la regla de invalidación.
+  - Menores documentados sin fix (README): la vela donde ocurre la
+    entrada queda excluida para siempre del seguimiento (hasta 4h sin
+    vigilar SL/TP); salidas por gap se registran al precio exacto del SL
+    (optimista); solape de 1 vela entre ventanas IS/OOS del walk-forward
+    (`df.loc` inclusivo en ambos extremos); frescura de datos solo se
+    comprueba sobre 1h (una señal 4h puede nacer de velas 4h obsoletas).
+
 ## 2026-07-05
 
 - **[2026-07-05]** **Ingesta de Reddit** (`services/fundamental/

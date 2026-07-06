@@ -89,6 +89,28 @@ def test_no_exit_yet():
     assert decision is None
 
 
+def test_in_progress_candle_is_ignored():
+    entry = base_entry()
+    # Esta vela tocaría el SL, pero todavía está EN CURSO (close_time > now):
+    # no debe evaluarse hasta que cierre — mismo criterio que
+    # `candles_to_frame` (FIX 2026-07-06, ver CHANGELOG). La vela abre en
+    # +1h y cierra en +2h; `now` está a mitad de la vela (+1h30).
+    candles = [make_candle(ENTRY_TIME + timedelta(hours=1), low="90", high="101", close="94")]
+    now = ENTRY_TIME + timedelta(hours=1, minutes=30)
+    assert evaluate_exit(entry, candles, base_settings(), now) is None
+
+
+def test_candle_evaluated_once_it_closes():
+    entry = base_entry()
+    # La misma vela del caso anterior, pero con `now` ya en su close_time:
+    # ahora sí debe disparar el SL.
+    candles = [make_candle(ENTRY_TIME + timedelta(hours=1), low="90", high="101", close="94")]
+    now = ENTRY_TIME + timedelta(hours=2)
+    decision = evaluate_exit(entry, candles, base_settings(), now)
+    assert decision is not None
+    assert decision.exit_type == "closed_sl"
+
+
 def test_candles_at_or_before_entry_time_are_ignored():
     entry = base_entry()
     # Esta vela SÍ tocaría el SL, pero es la vela que generó la señal

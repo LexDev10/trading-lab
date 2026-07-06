@@ -17,8 +17,7 @@ from sqlalchemy import select
 
 from db.models import EquitySnapshot, RegimeLog, SystemState, TradeEntry, TradeExit
 from db.session import get_session
-
-ENVIRONMENT = "paper"
+from services.risk.portfolio_state import ENVIRONMENT
 
 
 async def _print_system_state(session) -> None:
@@ -39,7 +38,9 @@ async def _print_equity(session) -> None:
     row = await session.scalar(
         select(EquitySnapshot)
         .where(EquitySnapshot.environment == ENVIRONMENT)
-        .order_by(EquitySnapshot.ts.desc())
+        # Por id (orden de inserción), igual que portfolio_state.get_latest_equity
+        # — ver FIX 2026-07-06 en ese módulo.
+        .order_by(EquitySnapshot.id.desc())
         .limit(1)
     )
     if row is None:

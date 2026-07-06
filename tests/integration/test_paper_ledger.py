@@ -8,7 +8,8 @@ sola llamada a Binance ni a ningún exchange en todo el test.
 
 Las marcas de tiempo se anclan a `datetime.now(tz=UTC)` real (no a una
 fecha fija en el pasado): `equity_snapshots` no tiene FK, así que "última
-equity" se decide por el `ts` más reciente sobre TODA la tabla
+equity" se decide por la última fila insertada (`id`, ver FIX 2026-07-06
+en `portfolio_state.py`; antes era por `ts`) sobre TODA la tabla
 `environment='paper'` — la app real corre en paralelo y ya genera
 operaciones de papel reales (ver `docs/PHASE_2_REPORT.md`, hallazgo de la
 sesión del 2026-07-03), así que una fecha fija en el pasado deja de ser
@@ -155,7 +156,7 @@ async def test_open_and_close_position_updates_ledger_and_portfolio_state():
 
     async with get_session() as session:
         entry = await session.get(TradeEntry, entry_id)
-        await close_position(session, settings, entry, exit_decision)
+        await close_position(session, settings, entry, exit_decision, now=exit_time)
         await session.commit()
 
     async with get_session() as session:

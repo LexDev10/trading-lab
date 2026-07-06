@@ -1,7 +1,21 @@
 """Estado de cartera para los checks de la sección 9.2. Se construye leyendo
 `trade_entries`/`trade_exits`/`equity_snapshots`/`system_state` — nunca se
 recalcula "a mano" en el risk engine, para que ejecución y backtesting/paper
-compartan la misma fuente de verdad."""
+compartan la misma fuente de verdad.
+
+# FIX (2026-07-06, ver CHANGELOG): todas las queries filtran ahora por
+# `environment` (única fuente de verdad: `ENVIRONMENT`, reutilizada por
+# paper_ledger/estado/daily_summary). Antes mezclaban environments: una fila
+# sembrada por un test de integración (`environment='test'`) o, en el futuro,
+# filas de testnet/live contaminaban la equity/exposición/cooldowns del
+# ledger de papel que consume el risk engine.
+#
+# FIX (2026-07-06): "última equity" se lee por `id` (orden de inserción,
+# monotónico) y no por `ts` — los snapshots se escriben con el `ts` del
+# momento de proceso, pero ordenar por `ts` era frágil ante cierres
+# procesados fuera de orden cronológico (el PnL del cierre con `ts` más
+# antiguo desaparecía de la curva de equity).
+"""
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -13,6 +27,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from db.models import DecisionLog, EquitySnapshot, SystemState, TradeEntry, TradeExit
+
+# Environment del ledger interno de papel (fase 1, sin executor real).
+# Definido aquí (y no en paper_ledger) porque este módulo es la fuente de
+# verdad de lectura de cartera; paper_ledger, estado y daily_summary lo
+# importan para no divergir. Cuando exista el executor real (testnet/live),
+# este valor pasará a depender de `settings.environment`.
+ENVIRONMENT = "paper"
 
 
 @dataclass
@@ -35,7 +56,12 @@ async def get_latest_equity(session: AsyncSession, settings: Settings) -> Decima
     si todavía no hay ningún `equity_snapshot`). Pública porque también la
     usa `services/execution/paper_ledger.py` al cerrar una posición —
     misma fuente de verdad que el risk engine, sin duplicar la query."""
-    stmt = select(EquitySnapshot.equity_quote).order_by(EquitySnapshot.ts.desc()).limit(1)
+    stmt = (
+        select(EquitySnapshot.equity_quote)
+        .where(EquitySnapshot.environment == ENVIRONMENT)
+        .order_by(EquitySnapshot.id.desc())
+        .limit(1)
+    )
     result = await session.execute(stmt)
     equity = result.scalar_one_or_none()
     if equity is not None:
@@ -47,7 +73,9 @@ async def get_latest_equity(session: AsyncSession, settings: Settings) -> Decima
 
 
 async def _get_open_positions(session: AsyncSession) -> tuple[int, Decimal]:
-    stmt = select(TradeEntry.entry_price, TradeEntry.qty).where(TradeEntry.status == "open")
+    stmt = select(TradeEntry.entry_price, TradeEntry.qty).where(
+        TradeEntry.environment == ENVIRONMENT, TradeEntry.status == "open"
+    )
     result = await session.execute(stmt)
     rows = result.all()
     exposure = sum((price * qty for price, qty in rows), Decimal("0"))
@@ -56,8 +84,10 @@ async def _get_open_positions(session: AsyncSession) -> tuple[int, Decimal]:
 
 async def _get_daily_realized_pnl_pct(session: AsyncSession, equity: Decimal, now: datetime) -> Decimal:
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    stmt = select(func.coalesce(func.sum(TradeExit.pnl_quote), Decimal("0"))).where(
-        TradeExit.exit_time >= day_start
+    stmt = (
+        select(func.coalesce(func.sum(TradeExit.pnl_quote), Decimal("0")))
+        .join(TradeEntry, TradeExit.trade_entry_id == TradeEntry.id)
+        .where(TradeEntry.environment == ENVIRONMENT, TradeExit.exit_time >= day_start)
     )
     result = await session.execute(stmt)
     pnl_quote = result.scalar_one()
@@ -67,7 +97,9 @@ async def _get_daily_realized_pnl_pct(session: AsyncSession, equity: Decimal, no
 
 
 async def _get_equity_peak(session: AsyncSession) -> Decimal | None:
-    stmt = select(func.max(EquitySnapshot.equity_quote))
+    stmt = select(func.max(EquitySnapshot.equity_quote)).where(
+        EquitySnapshot.environment == ENVIRONMENT
+    )
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
 
@@ -77,7 +109,10 @@ async def _get_drawdown_pct(session: AsyncSession) -> Decimal:
     if peak is None or peak <= 0:
         return Decimal("0")
     current = await session.execute(
-        select(EquitySnapshot.equity_quote).order_by(EquitySnapshot.ts.desc()).limit(1)
+        select(EquitySnapshot.equity_quote)
+        .where(EquitySnapshot.environment == ENVIRONMENT)
+        .order_by(EquitySnapshot.id.desc())
+        .limit(1)
     )
     current_equity = current.scalar_one_or_none()
     if current_equity is None:
@@ -114,7 +149,7 @@ async def _asset_cooldown_active(
         select(TradeExit.exit_time)
         .join(TradeEntry, TradeExit.trade_entry_id == TradeEntry.id)
         .join(DecisionLog, TradeEntry.decision_log_id == DecisionLog.id)
-        .where(DecisionLog.asset == asset)
+        .where(TradeEntry.environment == ENVIRONMENT, DecisionLog.asset == asset)
         .order_by(TradeExit.exit_time.desc())
         .limit(1)
     )
@@ -126,7 +161,13 @@ async def _asset_cooldown_active(
 
 
 async def _losses_cooldown_active(session: AsyncSession, cooldown_hours: int, now: datetime) -> bool:
-    stmt = select(TradeExit.exit_type, TradeExit.exit_time).order_by(TradeExit.exit_time.desc()).limit(2)
+    stmt = (
+        select(TradeExit.exit_type, TradeExit.exit_time)
+        .join(TradeEntry, TradeExit.trade_entry_id == TradeEntry.id)
+        .where(TradeEntry.environment == ENVIRONMENT)
+        .order_by(TradeExit.exit_time.desc())
+        .limit(2)
+    )
     result = await session.execute(stmt)
     rows = result.all()
     if len(rows) < 2:

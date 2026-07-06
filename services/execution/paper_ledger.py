@@ -27,6 +27,7 @@ para ejecutar.
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
+from typing import Protocol
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,11 +41,28 @@ from core.schemas.technical import TechnicalSignal
 from db.models import EquitySnapshot, PositionEvent, TradeEntry, TradeExit
 from notifications.telegram import send_message
 from services.data.persistence import get_recent_candles
-from services.risk.portfolio_state import compute_drawdown_pct, get_latest_equity
-
-ENVIRONMENT = "paper"
+from services.risk.portfolio_state import (
+    ENVIRONMENT,
+    compute_drawdown_pct,
+    get_latest_equity,
+)
 
 logger = get_logger("paper_ledger")
+
+
+class PaperEntryLike(Protocol):
+    """Atributos que `evaluate_exit` necesita de una entrada de papel.
+    `TradeEntry` (ORM) los cumple estructuralmente; `backtests/
+    strategy_breakout.py` reutiliza `evaluate_exit` tal cual pasando un
+    dataclass ligero que también los cumple — mismo código de decisión de
+    salida en vivo y en backtest (regla crítica, sección 6)."""
+
+    entry_time: datetime
+    entry_price: Decimal
+    sl: Decimal
+    tp: Decimal
+    invalidation_level: Decimal | None
+    horizon_class: str | None
 
 
 async def open_position(
@@ -115,26 +133,40 @@ class ExitDecision:
     exit_type: str
 
 
-def _max_hold(settings: Settings, horizon_class: str) -> timedelta:
+def max_hold_for_horizon(settings: Settings, horizon_class: str) -> timedelta:
+    """Única fuente de verdad del horizonte máximo de una posición (sección
+    10.1): 48h para señales intraday (1h), 7 días para swing (4h).
+    Reutilizada por `backtests/strategy_breakout.py` para acotar la
+    ventana de simulación de salida — mismo horizonte que en vivo."""
     if horizon_class == HorizonClass.hours.value:
         return timedelta(hours=settings.max_hold_hours_intraday)
     return timedelta(days=settings.max_hold_days_swing)
 
 
 def evaluate_exit(
-    entry: TradeEntry,
+    entry: PaperEntryLike,
     candles: list[Candle],
     settings: Settings,
     now: datetime,
 ) -> ExitDecision | None:
-    """Vela a vela (ascendente, solo velas con `open_time > entry_time`,
-    del mismo timeframe que la señal): ¿toca SL, TP o se invalida
-    técnicamente? SL se comprueba antes que TP si ambos se tocan en la
-    misma vela — criterio conservador, igual que documenta el backtest
-    (sección 14) para el caso ambiguo intra-vela. Si ninguna vela dispara
-    nada, se comprueba la salida por tiempo (horizonte de la señal) contra
-    `now`, no contra velas."""
-    relevant = [c for c in candles if c.open_time > entry.entry_time]
+    """Vela a vela (ascendente, solo velas CERRADAS con `open_time >
+    entry_time`, del mismo timeframe que la señal): ¿toca SL, TP o se
+    invalida técnicamente? SL se comprueba antes que TP si ambos se tocan
+    en la misma vela — criterio conservador, igual que documenta el
+    backtest (sección 14) para el caso ambiguo intra-vela. Si ninguna vela
+    dispara nada, se comprueba la salida por tiempo (horizonte de la señal)
+    contra `now`, no contra velas.
+
+    # FIX (2026-07-06, ver CHANGELOG): se excluye la vela en curso
+    # (`close_time > now`) — mismo criterio que `candles_to_frame`
+    # (anti look-ahead, sección 18). Antes, la kline en formación que
+    # Binance devuelve (y que la ingesta upsertea) se evaluaba: la
+    # invalidación usaba un `close` aún no definitivo (contradice la regla
+    # "invalidación por CIERRE") y `exit_time` podía quedar en el futuro
+    # (`close_time` reconstruido = open_time + duración > now)."""
+    relevant = [
+        c for c in candles if c.open_time > entry.entry_time and c.close_time <= now
+    ]
     for candle in relevant:
         if candle.low <= entry.sl:
             return ExitDecision(candle.close_time, entry.sl, TradeStatus.closed_sl.value)
@@ -144,7 +176,7 @@ def evaluate_exit(
             return ExitDecision(candle.close_time, candle.close, TradeStatus.closed_invalidated.value)
 
     if entry.horizon_class is not None:
-        max_hold = _max_hold(settings, entry.horizon_class)
+        max_hold = max_hold_for_horizon(settings, entry.horizon_class)
         if now - entry.entry_time >= max_hold:
             last_close = relevant[-1].close if relevant else entry.entry_price
             return ExitDecision(now, last_close, TradeStatus.closed_time.value)
@@ -152,17 +184,45 @@ def evaluate_exit(
     return None
 
 
+def compute_trade_pnl(
+    entry_price: Decimal, exit_price: Decimal, qty: Decimal, taker_fee: Decimal
+) -> tuple[Decimal, Decimal, Decimal]:
+    """Fees/PnL de un trade cerrado — fee de `taker_fee` por lado (entrada
+    + salida), igual que `sección 10.1`/`14`. Única fórmula, reutilizada
+    por `close_position` (paper ledger) y por `backtests/
+    strategy_breakout.py::simulate_trades` (con `qty=1` para el retorno a
+    nivel de instrumento) para no duplicarla (regla crítica, sección 6).
+    Devuelve `(fees_paid, pnl_quote, pnl_pct_net)`."""
+    entry_notional = qty * entry_price
+    exit_notional = qty * exit_price
+    fees_paid = taker_fee * (entry_notional + exit_notional)
+    pnl_quote = exit_notional - entry_notional - fees_paid
+    pnl_pct_net = pnl_quote / entry_notional if entry_notional > 0 else Decimal("0")
+    return fees_paid, pnl_quote, pnl_pct_net
+
+
 async def close_position(
     session: AsyncSession,
     settings: Settings,
     entry: TradeEntry,
     exit_decision: ExitDecision,
+    now: datetime,
 ) -> TradeExit:
-    entry_notional = entry.qty * entry.entry_price
-    exit_notional = entry.qty * exit_decision.exit_price
-    fees_paid = settings.taker_fee * (entry_notional + exit_notional)
-    pnl_quote = exit_notional - entry_notional - fees_paid
-    pnl_pct_net = pnl_quote / entry_notional if entry_notional > 0 else Decimal("0")
+    """`now` es el momento de PROCESO del cierre y es el `ts` del
+    `EquitySnapshot` que se inserta.
+
+    # FIX (2026-07-06, ver CHANGELOG): antes el snapshot usaba
+    # `ts=exit_decision.exit_time` (el close de la vela, potencialmente
+    # horas en el pasado) y `get_latest_equity` ordenaba por `ts`: si dos
+    # cierres se procesaban en el mismo ciclo con exit_times no
+    # cronológicos, el snapshot "más antiguo" quedaba invisible y su PnL
+    # desaparecía de la curva de equity (y del drawdown/killswitch).
+    # `trade_exits.exit_time` y el `position_event` conservan el tiempo de
+    # la vela (cuándo ocurrió la salida); solo la curva de equity usa el
+    # tiempo de proceso, que es monotónico."""
+    fees_paid, pnl_quote, pnl_pct_net = compute_trade_pnl(
+        entry.entry_price, exit_decision.exit_price, entry.qty, settings.taker_fee
+    )
 
     exit_row = TradeExit(
         trade_entry_id=entry.id,
@@ -200,7 +260,7 @@ async def close_position(
     open_positions_remaining = len(open_result.all())
     session.add(
         EquitySnapshot(
-            ts=exit_decision.exit_time,
+            ts=now,
             environment=ENVIRONMENT,
             equity_quote=new_equity,
             open_positions=open_positions_remaining,
@@ -241,7 +301,7 @@ async def update_open_positions(session: AsyncSession, settings: Settings, now: 
         candles = await get_recent_candles(session, entry.asset, entry.timeframe, 500)
         exit_decision = evaluate_exit(entry, candles, settings, now)
         if exit_decision is not None:
-            await close_position(session, settings, entry, exit_decision)
+            await close_position(session, settings, entry, exit_decision, now)
             counts["closed"] += 1
 
     return counts

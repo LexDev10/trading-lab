@@ -9,7 +9,6 @@ se ejecuta en el ciclo rápido de tests unitarios sin DB; correr con:
     docker compose exec app uv run pytest tests/integration -v
 """
 
-from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -52,20 +51,6 @@ async def _clean_system_state():
         await session.commit()
 
 
-async def _seed_equity(equity: Decimal) -> None:
-    async with get_session() as session:
-        session.add(
-            EquitySnapshot(
-                ts=datetime.now(tz=UTC),
-                environment="test",
-                equity_quote=equity,
-                open_positions=0,
-                drawdown_pct=Decimal("0"),
-            )
-        )
-        await session.commit()
-
-
 @pytest.mark.asyncio
 async def test_halt_blocks_entries_and_rearm_unblocks_them():
     """Este test comparte Postgres con la app real corriendo en paralelo
@@ -79,7 +64,11 @@ async def test_halt_blocks_entries_and_rearm_unblocks_them():
       depende de checks que si hay trading real concurrente, no lo son
       (exposición, correlación) — no se afirma sobre `approved` ahí."""
     settings = get_settings()
-    await _seed_equity(Decimal("10000"))
+    # Nota: antes se sembraba un EquitySnapshot con environment='test' —
+    # desde el FIX 2026-07-06 (portfolio_state filtra por environment) esas
+    # filas ya no influyen en el risk engine, así que se eliminó el seed;
+    # la equity cae al bootstrap PAPER_STARTING_EQUITY_USDT (irrelevante
+    # para lo que este test afirma).
 
     # 1. Sistema running (default, sin fila en system_state) -> el check
     #    específico de halt está en verde.
