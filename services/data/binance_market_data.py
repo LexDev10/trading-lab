@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Literal
 
+from binance.error import ClientError
 from binance.spot import Spot
 
 from core.schemas.market import Candle, MarketSnapshot
@@ -91,7 +92,23 @@ class BinanceMarketData:
         return all_candles
 
     def symbol_exists(self, asset: str) -> bool:
-        info = self._client.exchange_info(symbol=asset)
+        """Comprueba si el símbolo existe en Binance Spot vía `exchangeInfo`.
+
+        # FIX (2026-07-07, fase 3 dashboard): para un símbolo que NO
+        # existe, `exchange_info` no devuelve una lista vacía — Binance
+        # responde HTTP 400 con `error_code=-1121` ("Invalid symbol").
+        # Antes esta función dejaba propagar esa excepción sin capturarla,
+        # así que un símbolo inválido tumbaba `scripts/analiza.py` (y el
+        # botón "Analizar ahora" del dashboard, que llama a esto
+        # precisamente para dar un "Rechazado: ... no existe" limpio) con
+        # un traceback crudo en vez del mensaje de rechazo esperado.
+        """
+        try:
+            info = self._client.exchange_info(symbol=asset)
+        except ClientError as exc:
+            if exc.error_code == -1121:
+                return False
+            raise
         return len(info.get("symbols", [])) > 0
 
     def get_min_notional(self, asset: str) -> Decimal:

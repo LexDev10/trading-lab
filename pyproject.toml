@@ -20,6 +20,7 @@ dependencies = [
     "plotly>=5.0,<5.19",  # vectorbt 0.26 usa trace types (heatmapgl) retirados en plotly posteriores
     "httpx>=0.27,<1.0",  # alertas Telegram + descarga RSS/JSON fundamental (fase 2), async, encaja con el resto del stack
     "feedparser>=6.0,<7.0",  # parseo de RSS estándar (CoinDesk, The Block) para el almacén PIT (sección 12.2)
+    "streamlit>=1.40,<2.0",  # dashboard de solo lectura (fase 3) — servicio nuevo en docker-compose, no toca FastAPI/app
 ]
 
 [dependency-groups]
@@ -56,4 +57,4 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["app", "core", "services", "db", "notifications", "backtests", "journal", "scripts"]
+packages = ["app", "core", "services", "db", "notifications", "backtests", "journal", "scripts", "dashboard"]

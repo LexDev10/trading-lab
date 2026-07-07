@@ -5,6 +5,9 @@ import json
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
+from binance.error import ClientError
+
 from services.data.binance_market_data import BinanceMarketData
 
 FIXTURES = Path(__file__).parent.parent / "fixtures"
@@ -41,3 +44,35 @@ def test_fetch_ticker_24h_parses_fixture_and_computes_spread(monkeypatch):
     # spread_bps = (ask-bid)/mid * 10000
     assert snap.spread_bps > Decimal("0")
     assert snap.quote_vol_24h == Decimal("534798000.00000000")
+
+
+def test_symbol_exists_returns_true_when_found(monkeypatch):
+    client = BinanceMarketData()
+    monkeypatch.setattr(client._client, "exchange_info", lambda **kwargs: {"symbols": [{"symbol": "BTCUSDT"}]})
+
+    assert client.symbol_exists("BTCUSDT") is True
+
+
+def test_symbol_exists_returns_false_for_invalid_symbol_error(monkeypatch):
+    """FIX (2026-07-07): Binance no devuelve una lista vacía para un
+    símbolo inexistente, responde HTTP 400 / error_code=-1121."""
+    client = BinanceMarketData()
+
+    def _raise(**kwargs):
+        raise ClientError(400, -1121, "Invalid symbol.", {})
+
+    monkeypatch.setattr(client._client, "exchange_info", _raise)
+
+    assert client.symbol_exists("NOEXISTEUSDT") is False
+
+
+def test_symbol_exists_reraises_other_client_errors(monkeypatch):
+    client = BinanceMarketData()
+
+    def _raise(**kwargs):
+        raise ClientError(418, -1003, "Too many requests.", {})
+
+    monkeypatch.setattr(client._client, "exchange_info", _raise)
+
+    with pytest.raises(ClientError):
+        client.symbol_exists("BTCUSDT")

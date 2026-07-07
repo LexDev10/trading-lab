@@ -17,19 +17,30 @@ abriendo una posición de PAPEL (simulación sobre velas reales, sin
 exchange — ver `services/execution/paper_ledger.py`); nunca se envía
 ninguna orden real (el executor OCO contra testnet sigue bloqueado por
 credenciales).
+
+# DECISION (2026-07-07, fase 3 dashboard): `analiza()` (CLI, imprime) se
+# separó de `run_manual_analysis()` (sin prints, devuelve un
+# `ManualAnalysisResult`) para que `dashboard/` pueda ofrecer el mismo
+# botón "Analizar ahora" reutilizando ESTA función — una sola
+# implementación (regla crítica, sección 6), el CLI es ahora un wrapper
+# fino que solo formatea la salida de consola a partir del resultado.
 """
 
 import argparse
 import asyncio
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import func, select
 
 from app.config import Settings, get_settings
-from core.enums import FinalAction, Trigger
+from core.enums import FinalAction, FundamentalStance, Regime, Trigger
 from core.git_info import get_git_sha
 from core.schemas.decision import DecisionRecord
+from core.schemas.risk import RiskVerdict
+from core.schemas.technical import TechnicalSignal
 from db.models import DecisionLog
 from db.session import get_session
 from journal.decision_logger import log_decision
@@ -59,40 +70,75 @@ def _print_header(asset: str, trigger_mode: str) -> None:
     print("=" * 60)
 
 
-async def analiza(asset: str, operar: bool) -> None:
+@dataclass
+class ManualAnalysisResult:
+    """Resultado sin formatear de `run_manual_analysis` — el CLI
+    (`analiza`) lo imprime tal cual lo hacía antes de la fase 3;
+    `dashboard/` lo pinta con sus propios componentes visuales. Ningún
+    campo aquí implica una decisión nueva: es la misma información que
+    ya calculaba `evaluate_asset`/`decide_final_action`, solo capturada
+    en vez de impresa."""
+
+    asset: str
+    trigger_mode: str
+    system_mode: str
+    early_rejection: str | None = None
+    warnings: list[str] = field(default_factory=list)
+    regime: Regime | None = None
+    regime_details: dict[str, Any] | None = None
+    regime_blocks: bool | None = None
+    scanner_checks: dict[str, bool] | None = None
+    technical_signal: TechnicalSignal | None = None
+    risk_verdict: RiskVerdict | None = None
+    fundamental_stance: FundamentalStance | None = None
+    policy_action: str | None = None
+    policy_size_multiplier: Decimal | None = None
+    final_action: FinalAction | None = None
+    rejection_reasons: list[str] = field(default_factory=list)
+    decision_log_id: int | None = None
+    opened_position: bool = False
+    open_message: str | None = None
+
+
+async def run_manual_analysis(asset: str, operar: bool) -> ManualAnalysisResult:
+    """Núcleo del modo manual — sin ningún `print()`. Descarga datos
+    frescos, corre el pipeline compartido (`evaluate_asset`) y, si
+    corresponde, registra la decisión y (en modo operar, si el risk
+    engine aprueba) abre una posición de papel. Devuelve un
+    `ManualAnalysisResult` con todo lo que antes solo se imprimía."""
     settings = get_settings()
     now = datetime.now(tz=UTC)
     asset = asset.upper().strip()
     trigger_mode = "operar" if operar else "informe"
-    _print_header(asset, trigger_mode)
+    result = ManualAnalysisResult(asset=asset, trigger_mode=trigger_mode, system_mode=settings.mode)
 
     if not asset.endswith("USDT"):
-        print("Rechazado: en el MVP solo se admiten pares cotizados en USDT.")
-        return
+        result.early_rejection = "Rechazado: en el MVP solo se admiten pares cotizados en USDT."
+        return result
 
     base = asset.removesuffix("USDT")
     if base in STABLECOIN_BASES or asset in STABLECOIN_BASES:
-        print(
+        result.early_rejection = (
             "Las stablecoins no son activos operables: sin volatilidad "
             "direccional no hay setup posible (sección 21.5). No se "
             "realiza análisis."
         )
-        return
+        return result
 
     client = BinanceMarketData()
 
     exists = await asyncio.to_thread(client.symbol_exists, asset)
     if not exists:
-        print(f"Rechazado: {asset} no existe en Binance Spot (exchangeInfo).")
-        return
+        result.early_rejection = f"Rechazado: {asset} no existe en Binance Spot (exchangeInfo)."
+        return result
 
     async with get_session() as session:
         if not await _check_manual_rate_limit(session, settings, now):
-            print(
+            result.early_rejection = (
                 f"Rechazado: límite de {settings.manual_max_per_hour} análisis "
                 "manuales por hora alcanzado (MANUAL_MAX_PER_HOUR)."
             )
-            return
+            return result
 
         # --- Descarga (siempre fresca) + persistencia point-in-time ---
         btc_1h = await asyncio.to_thread(client.fetch_klines, BTC_ASSET, "1h", 500)
@@ -110,8 +156,8 @@ async def analiza(asset: str, operar: bool) -> None:
         await session.commit()
 
         if len(asset_1h) < settings.manual_min_candles_1h:
-            print(
-                f"Aviso: solo hay {len(asset_1h)} velas 1h disponibles "
+            result.warnings.append(
+                f"Solo hay {len(asset_1h)} velas 1h disponibles "
                 f"(mínimo esperado {settings.manual_min_candles_1h}); "
                 "el informe continúa con lo disponible (fail-closed en los "
                 "checks que lo requieran)."
@@ -120,10 +166,9 @@ async def analiza(asset: str, operar: bool) -> None:
         # --- Régimen BTC (sección 8.3) ---
         btc_4h_df = candles_to_frame(btc_4h, now=now)
         regime, regime_details, regime_blocks = await evaluate_regime(session, btc_4h_df, now)
-
-        print(f"\nRégimen BTC (4h): {regime.value}  {'[BLOQUEA ENTRADAS]' if regime_blocks else ''}")
-        for k, v in regime_details.items():
-            print(f"  - {k}: {v}")
+        result.regime = regime
+        result.regime_details = regime_details
+        result.regime_blocks = regime_blocks
 
         # --- Pipeline compartido: filtros duros + técnico + risk engine ---
         asset_1h_df = candles_to_frame(asset_1h, now=now)
@@ -141,41 +186,16 @@ async def analiza(asset: str, operar: bool) -> None:
             settings=settings,
             now=now,
         )
-
-        print("\nFiltros duros del scanner:")
-        for name, passed in evaluation.scanner_payload["checks"].items():
-            print(f"  [{'OK' if passed else 'FALLA'}] {name}")
+        result.scanner_checks = evaluation.scanner_payload["checks"]
 
         technical_signal = evaluation.technical_signal
         risk_verdict = evaluation.risk_verdict
-
-        if technical_signal is None:
-            print("\nNo se detectó ningún setup de ruptura de rango confirmado por volumen"
-                  " (o los filtros duros no pasaron).")
-        else:
-            print(f"\nSetup técnico detectado: {technical_signal.setup_type} "
-                  f"({technical_signal.timeframe}, conviction={technical_signal.conviction.value})")
-            print(f"  entry_zone: {technical_signal.entry_zone}")
-            print(f"  stop_loss: {technical_signal.stop_loss}")
-            print(f"  take_profit: {technical_signal.take_profit}")
-            print(f"  atr_14: {technical_signal.atr_14}")
-            print(f"  rel_volume: {technical_signal.rel_volume}")
-
-            if risk_verdict is not None:
-                print("\nRisk engine — checklist completo:")
-                for name, passed in risk_verdict.checks.items():
-                    print(f"  [{'OK' if passed else 'FALLA'}] {name}")
-                print(f"\n  approved={risk_verdict.approved}")
-                print(f"  rr_net_of_fees={risk_verdict.rr_net_of_fees}")
-                print(f"  size_quote={risk_verdict.size_quote}")
-
-            if evaluation.policy_outcome is not None:
-                print(
-                    f"\nMeta-decider (MODE={settings.mode}): stance="
-                    f"{evaluation.fundamental_stance.value if evaluation.fundamental_stance else '?'} "
-                    f"-> {evaluation.policy_outcome.action} "
-                    f"(size x{evaluation.policy_outcome.size_multiplier})"
-                )
+        result.technical_signal = technical_signal
+        result.risk_verdict = risk_verdict
+        if evaluation.policy_outcome is not None:
+            result.fundamental_stance = evaluation.fundamental_stance
+            result.policy_action = evaluation.policy_outcome.action
+            result.policy_size_multiplier = evaluation.policy_outcome.size_multiplier
 
         # --- Decisión final ---
         mode = "operate" if operar else "informe"
@@ -184,6 +204,8 @@ async def analiza(asset: str, operar: bool) -> None:
         )
         if would_enter_no_executor:
             final_action = FinalAction.enter
+        result.final_action = final_action
+        result.rejection_reasons = [r.value for r in evaluation.rejection_reasons]
 
         decision_payload = None
         if evaluation.policy_outcome is not None:
@@ -210,6 +232,7 @@ async def analiza(asset: str, operar: bool) -> None:
             horizon_class=technical_signal.horizon_class if technical_signal else None,
         )
         decision_log_id = await log_decision(session, record)
+        result.decision_log_id = decision_log_id
 
         open_message: str | None = None
         if would_enter_no_executor:
@@ -227,27 +250,104 @@ async def analiza(asset: str, operar: bool) -> None:
                 decision_log_id=decision_log_id,
                 asset=asset,
                 technical_signal=technical_signal,
-                risk_verdict=risk_verdict,
+                # FIX (2026-07-07, fase 3 dashboard): antes se pasaba
+                # `risk_verdict` (sin ajustar) en vez de
+                # `risk_verdict_for_entry` — el multiplicador de tamaño
+                # del meta-decider (policy_outcome) se calculaba y se
+                # descartaba sin aplicarse nunca. `run_scan_cycle` (ciclo
+                # automático) ya usaba `risk_verdict_for_entry`
+                # correctamente; esto alinea el modo manual con el mismo
+                # criterio.
+                risk_verdict=risk_verdict_for_entry,
                 entry_price=evaluation.entry_price,
                 now=now,
             )
-            print(
-                "\n>>> El risk engine APRUEBA esta operación: se registra una "
-                "ORDEN PENDIENTE de papel (fill simulado sobre velas reales, "
-                "sin exchange). No se ha enviado ninguna orden real. <<<"
-            )
+            result.opened_position = True
+            result.open_message = open_message
 
         await session.commit()
 
-        # FIX (2026-07-07, bug #15 CODE_REVIEW_2026-07-07.md): Telegram se
-        # envía DESPUÉS del commit, no dentro de `open_position`.
         if open_message is not None:
             await send_message(settings, open_message)
 
-        print(f"\nfinal_action: {final_action.value}")
-        print(f"rejection_reasons: {[r.value for r in evaluation.rejection_reasons]}")
-        print(f"decision_log_id: {decision_log_id}")
-        print("=" * 60)
+    return result
+
+
+async def analiza(asset: str, operar: bool) -> None:
+    """Wrapper CLI: llama a `run_manual_analysis` y formatea EXACTAMENTE
+    la misma salida de consola que antes de la fase 3 — ningún cambio de
+    comportamiento salvo el fix documentado arriba en
+    `run_manual_analysis`."""
+    normalized_asset = asset.upper().strip()
+    trigger_mode = "operar" if operar else "informe"
+    _print_header(normalized_asset, trigger_mode)
+
+    result = await run_manual_analysis(asset, operar)
+
+    if result.early_rejection:
+        print(result.early_rejection)
+        return
+
+    for warning in result.warnings:
+        print(f"Aviso: {warning}")
+
+    assert result.regime is not None and result.regime_details is not None
+    print(f"\nRégimen BTC (4h): {result.regime.value}  {'[BLOQUEA ENTRADAS]' if result.regime_blocks else ''}")
+    for k, v in result.regime_details.items():
+        print(f"  - {k}: {v}")
+
+    assert result.scanner_checks is not None
+    print("\nFiltros duros del scanner:")
+    for name, passed in result.scanner_checks.items():
+        print(f"  [{'OK' if passed else 'FALLA'}] {name}")
+
+    technical_signal = result.technical_signal
+    risk_verdict = result.risk_verdict
+
+    if technical_signal is None:
+        print(
+            "\nNo se detectó ningún setup de ruptura de rango confirmado por volumen"
+            " (o los filtros duros no pasaron)."
+        )
+    else:
+        print(
+            f"\nSetup técnico detectado: {technical_signal.setup_type} "
+            f"({technical_signal.timeframe}, conviction={technical_signal.conviction.value})"
+        )
+        print(f"  entry_zone: {technical_signal.entry_zone}")
+        print(f"  stop_loss: {technical_signal.stop_loss}")
+        print(f"  take_profit: {technical_signal.take_profit}")
+        print(f"  atr_14: {technical_signal.atr_14}")
+        print(f"  rel_volume: {technical_signal.rel_volume}")
+
+        if risk_verdict is not None:
+            print("\nRisk engine — checklist completo:")
+            for name, passed in risk_verdict.checks.items():
+                print(f"  [{'OK' if passed else 'FALLA'}] {name}")
+            print(f"\n  approved={risk_verdict.approved}")
+            print(f"  rr_net_of_fees={risk_verdict.rr_net_of_fees}")
+            print(f"  size_quote={risk_verdict.size_quote}")
+
+        if result.policy_action is not None:
+            print(
+                f"\nMeta-decider (MODE={result.system_mode}): stance="
+                f"{result.fundamental_stance.value if result.fundamental_stance else '?'} "
+                f"-> {result.policy_action} "
+                f"(size x{result.policy_size_multiplier})"
+            )
+
+    if result.opened_position:
+        print(
+            "\n>>> El risk engine APRUEBA esta operación: se registra una "
+            "ORDEN PENDIENTE de papel (fill simulado sobre velas reales, "
+            "sin exchange). No se ha enviado ninguna orden real. <<<"
+        )
+
+    assert result.final_action is not None
+    print(f"\nfinal_action: {result.final_action.value}")
+    print(f"rejection_reasons: {result.rejection_reasons}")
+    print(f"decision_log_id: {result.decision_log_id}")
+    print("=" * 60)
 
 
 def main() -> None:

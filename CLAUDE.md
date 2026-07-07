@@ -185,9 +185,21 @@ horizonte caiga después de la última vela disponible.)
   gates deben contarse desde código corregido y congelado — la base de
   datos se reinició por completo el 2026-07-07 para partir de cero con
   el esquema y el código corregidos.
-- **`backtests/RESULTS.md` desactualizado**: generado con el modelo de
-  fill optimista (bug #11, corregido el 2026-07-07) — recalcular con
-  `python -m backtests.walk_forward` antes de citar su expectancy.
+- **`backtests/RESULTS.md` — RECALCULADO el 2026-07-07** con el modelo de
+  fill pendiente corregido (bug #11): expectancy bajó de +0.096% a
+  +0.0438%/trade (719 trades OOS), profit factor 1.99→1.41, sigue
+  positiva. Max drawdown de la curva secuencial sin restricciones:
+  −13.78%, por encima de `drawdown_killswitch` (10%, `app/config.py`).
+  **Cuantificado con `backtests/simulate_killswitch.py`** (nuevo script,
+  mismo día): aplicando el freno del 10% sobre esa misma lista de
+  trades, incluso en el escenario más pesimista posible (freno
+  permanente sin recuperación — limitación explícita del modelo de una
+  sola posición secuencial), TODAS las métricas mejoran: expectancy
+  +0.066%, profit factor 1.63, drawdown se queda en −10.11%, retorno
+  compuesto +41.9% (vs +36.4% sin freno). Ver sección "Simulación del
+  kill-switch" de `backtests/RESULTS.md` — el kill-switch parece cumplir
+  su función en esta historia concreta, sin perjudicar el resultado
+  medio (no generalizar como garantía para toda secuencia futura).
 - `scripts/check_live_gates.py` no existe todavía (sección 15 lo exige).
 - Executor OCO real + reconciliación contra testnet: sin construir
   (bloqueado por credenciales). Los criterios de aceptación de Fase 1
