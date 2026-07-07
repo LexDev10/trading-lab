@@ -68,6 +68,14 @@ class Settings(BaseSettings):
     # veto permanece "activo" tras clasificarse. 24h es conservador
     # (bloquea/cierra durante aprox. un día tras el evento) y configurable.
     fundamental_veto_hours: int = 24
+    # DECISION (2026-07-07, bug #18 CODE_REVIEW_2026-07-07.md): un veto de
+    # fuente `social` (Reddit, contenido no autenticado, prompt injection
+    # trivial) solo bloquea ENTRADAS nuevas (risk engine); el cierre
+    # forzoso de una posición ABIERTA requiere `veto=true` en fuentes
+    # `news` de al menos `fundamental_veto_min_sources` fuentes
+    # independientes distintas dentro de la ventana — ver
+    # `services/fundamental/veto.py::asset_has_active_closing_veto`.
+    fundamental_veto_min_sources: int = 2
     # DECISION (2026-07-06, fase 3, sección 13): "un LLM externo (API,
     # opcional)" redacta el memo del trade, nunca decide. Sin API key ni
     # `USE_REMOTE_LLM=true`, `generate_trade_memo` no toca la red (mismo

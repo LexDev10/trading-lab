@@ -2,9 +2,103 @@
 
 Lee primero `ESPECIFICACION_SISTEMA_TRADING.md` (documento de trabajo
 completo, fases y criterios de aceptación) y el `CHANGELOG.md`. Este
-archivo resume los **bugs conocidos, corregidos y pendientes** de la
-revisión de código del 2026-07-06, para que no se reintroduzcan ni se
-olviden.
+archivo resume los **bugs conocidos, corregidos y pendientes** de las
+revisiones de código del 2026-07-06 y 2026-07-07, para que no se
+reintroduzcan ni se olviden.
+
+---
+
+## Bugs YA CORREGIDOS el 2026-07-07 — NO reintroducir
+
+Detalle completo en `docs/CODE_REVIEW_2026-07-07.md` y `CHANGELOG.md`
+(entrada 2026-07-07). Migraciones `0007`-`0009`. Reglas que esos fixes
+dejaron establecidas:
+
+10. **Nunca dos posiciones sobre el mismo activo/vela.**
+    `PortfolioSnapshot.asset_has_open_position` (calculado en
+    `portfolio_state.py`, filtra `status IN ('pending','open')`) es un
+    check más del risk engine (`checks["no_open_position_same_asset"]`,
+    `RejectionReason.position_already_open`) — nunca se salta. Segunda
+    capa: `trade_entries.signal_candle_close_time` +
+    `paper_ledger.signal_already_traded` — dedupe explícito por
+    `(asset, timeframe, signal_candle_close_time)` antes de
+    `open_position`. Cualquier camino nuevo hacia `open_position` debe
+    pasar por ambos.
+
+11. **`open_position` registra una orden PENDIENTE, nunca un fill inmediato.**
+    `status='pending'` + `entry_zone_low`/`entry_zone_high` (columnas
+    nuevas). El fill real lo decide `paper_ledger.evaluate_pending_fill`
+    vela a vela contra la `entry_zone`, respetando
+    `settings.entry_ttl_minutes` (existía en `Settings` desde el origen
+    del proyecto pero nunca se usaba — el fill era inmediato y optimista
+    a `entry_ref`, un precio que el mercado nunca confirmaba). Sin fill
+    dentro del TTL → `status='expired'` (sin trade_exit, sin impacto en
+    equity). **DECISION crítica**: `evaluate_pending_fill` SÍ admite la
+    vela en curso (`open_time <= now`, sin exigir `close_time <= now`) —
+    a diferencia de `evaluate_exit`. Es obligatorio: `entry_ttl_minutes`
+    (45 por defecto) es menor que cualquier timeframe operado (1h/4h);
+    exigir vela cerrada haría que la orden expirase siempre y ninguna
+    posición se abriría jamás. `backtests/strategy_breakout.py::simulate_trades`
+    reutiliza la misma función (regla sección 6) — **`backtests/RESULTS.md`
+    quedó desactualizado por este fix y debe recalcularse** antes de
+    usarse para decidir nada (la expectancy va a bajar).
+
+12. **Orden del ciclo: cerrar SIEMPRE antes de escanear.**
+    `app/scheduler.py::market_cycle_job` procesa
+    `update_open_positions` ANTES de `run_scan_cycle` — al revés, el
+    risk engine evaluaba `daily_loss_limit`/cooldown de 2 SL con cierres
+    del propio ciclo todavía sin registrar.
+
+13. **El clasificador nunca deja un item "pendiente para siempre".**
+    `classify.py::_classify_and_persist` persiste una fila neutra
+    (`stance=unknown`, `veto=False`, `summary=classification_failed`)
+    también cuando el item FALLA — antes, un puñado de items que
+    fallaran de forma determinista agotaba todo el presupuesto del batch
+    en cada corrida (head-of-line blocking) y ningún item nuevo se
+    clasificaba jamás.
+
+14. **Scorecard: upsert, no INSERT; horizonte real, no truncado; todos los `asset_tags`.**
+    Constraint único `(week, stance, horizon)` + `ON CONFLICT DO UPDATE`
+    — recalcular la misma semana ya no duplica filas. Un punto se
+    descarta si no hay vela real a la distancia del horizonte (antes se
+    aproximaba con la última vela disponible). Itera TODOS los
+    `asset_tags` de un item.
+
+15. **Telegram se envía DESPUÉS del commit, nunca dentro de la transacción.**
+    `open_position`/`close_position`/`update_open_positions`/
+    `run_scan_cycle` devuelven el texto del mensaje en vez de llamar a
+    `send_message` — el caller (`app/scheduler.py`, `scripts/analiza.py`)
+    lo envía tras `session.commit()`. `run_scan_cycle` además evalúa cada
+    activo dentro de un `try/except`: un fallo en un activo no debe
+    tumbar el resto del universo.
+
+16. **El veto fundamental nunca pisa un SL/TP/invalidación ya ocurrido.**
+    En `evaluate_exit`, la rama `veto_active` se comprueba DESPUÉS del
+    bucle de velas (SL/TP/invalidación), nunca antes — sigue siendo más
+    urgente que la salida por tiempo, pero no reescribe una salida que
+    el mercado ya había decidido en una vela anterior.
+
+17. **`daily_loss_limit`/resumen diario agregan por tiempo de PROCESO.**
+    Columna nueva `trade_exits.processed_at` (monotónica, rellenada por
+    `close_position` con `now`) — mismo criterio que el fix del bug #1 en
+    la curva de equity. `portfolio_state._get_daily_realized_pnl_pct` y
+    `daily_summary._trades_today` filtran por `processed_at`, nunca por
+    `exit_time` (tiempo de vela, puede quedar horas en el pasado).
+
+18. **El cierre forzoso de una posición exige corroboración de fuentes NEWS.**
+    `services/fundamental/veto.py::asset_has_active_closing_veto`
+    (usada por `paper_ledger` para el cierre anticipado) exige
+    `item_kind='news'` y al menos `settings.fundamental_veto_min_sources`
+    (2 por defecto) valores DISTINTOS de `source` en veto dentro de la
+    ventana. `asset_has_active_veto` (bloqueo de ENTRADAS nuevas, sin
+    cambios de comportamiento) sigue aceptando cualquier fuente,
+    incluida `social`. La ventana de decaimiento (`FUNDAMENTAL_VETO_HOURS`)
+    se mide desde `published_at` (columna nueva en `item_classifications`,
+    con fallback a `classified_at` si es NULL), no desde `classified_at`
+    — un backlog viejo clasificado tarde ya no genera vetos "frescos".
+    Motivo: un LLM clasificando contenido de Reddit no autenticado
+    (prompt injection trivial) no debe poder forzar el cierre de una
+    posición real por sí solo.
 
 ---
 
@@ -85,8 +179,15 @@ horizonte caiga después de la última vela disponible.)
 
 - **Purgar/reiniciar el histórico de paper trading**: los datos
   acumulados ANTES del 2026-07-06 se generaron con los bugs 1-2 activos
-  (equity y salidas potencialmente corruptas). Los ≥60 días / ≥30 trades
-  de los gates deben contarse desde código corregido y congelado.
+  (equity y salidas potencialmente corruptas), y los acumulados ANTES
+  del 2026-07-07 con los bugs 10-12 activos (posiciones duplicadas,
+  fill optimista, orden del ciclo). Los ≥60 días / ≥30 trades de los
+  gates deben contarse desde código corregido y congelado — la base de
+  datos se reinició por completo el 2026-07-07 para partir de cero con
+  el esquema y el código corregidos.
+- **`backtests/RESULTS.md` desactualizado**: generado con el modelo de
+  fill optimista (bug #11, corregido el 2026-07-07) — recalcular con
+  `python -m backtests.walk_forward` antes de citar su expectancy.
 - `scripts/check_live_gates.py` no existe todavía (sección 15 lo exige).
 - Executor OCO real + reconciliación contra testnet: sin construir
   (bloqueado por credenciales). Los criterios de aceptación de Fase 1
@@ -95,8 +196,18 @@ horizonte caiga después de la última vela disponible.)
   --rm --no-deps app uv run pytest -v` (72 unit) + `docker compose exec
   app uv run pytest tests/integration -v` (6 integration) + `mypy .`
   (165→169 errores frente al HEAD original, sin categorías nuevas — solo
-  la misma deuda preexistente de anotaciones en tests). Repetir esta
-  verificación tras cualquier cambio en
+  la misma deuda preexistente de anotaciones en tests).
+- **Verificado el 2026-07-07 en Docker** (bugs 10-18): `docker compose
+  exec app uv run pytest -q` (128 unit) + `docker compose exec app uv run
+  pytest tests/integration -q` (25 integration), todos en verde; `mypy .`
+  sin categorías de error nuevas (mismo criterio que el 2026-07-06).
+  **Importante — sin bind mount** (ver memoria de sesión): el contenedor
+  `app` NO ve cambios del host en caliente; hace falta
+  `docker compose up -d --build app` tras CADA edición antes de volver a
+  correr tests, o se estará testeando código obsoleto (o, peor, un
+  `alembic upgrade head` fallará con "Can't locate revision" si el
+  contenedor viejo corre contra migraciones que ya no existen en el
+  código montado). Repetir esta verificación tras cualquier cambio en
   `paper_ledger`/`portfolio_state`/`backtests`.
 - `.env` contiene un token real de Telegram (no está en git, verificado);
   no moverlo a código ni a ejemplos, y rotarlo si la carpeta se comparte.

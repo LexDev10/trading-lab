@@ -49,6 +49,24 @@ async def _print_equity(session) -> None:
     print(f"Equity (paper): {row.equity_quote} USDT  |  drawdown: {row.drawdown_pct:.2%}  ({row.ts.isoformat()})")
 
 
+async def _print_pending_orders(session, now: datetime) -> None:
+    """FIX (2026-07-07, bug #11 CODE_REVIEW_2026-07-07.md): desde el modelo
+    de fill pendiente, una entrada aprobada no aparece como "abierta" hasta
+    que una vela real toca la zona de entrada — sin esto, `/estado`
+    ocultaría órdenes reales a la espera de fill."""
+    result = await session.execute(
+        select(TradeEntry).where(TradeEntry.environment == ENVIRONMENT, TradeEntry.status == "pending")
+    )
+    entries = list(result.scalars().all())
+    print(f"\nÓrdenes de papel pendientes de fill: {len(entries)}")
+    for entry in entries:
+        age = now - entry.entry_time
+        print(
+            f"  - {entry.asset}: zona=[{entry.entry_zone_low}, {entry.entry_zone_high}] "
+            f"sl={entry.sl} tp={entry.tp} antigüedad={age}"
+        )
+
+
 async def _print_open_positions(session, now: datetime) -> None:
     result = await session.execute(
         select(TradeEntry).where(TradeEntry.environment == ENVIRONMENT, TradeEntry.status == "open")
@@ -88,6 +106,7 @@ async def estado() -> None:
         await _print_system_state(session)
         await _print_regime(session)
         await _print_equity(session)
+        await _print_pending_orders(session, now)
         await _print_open_positions(session, now)
         await _print_closed_summary(session)
     print("=" * 60)

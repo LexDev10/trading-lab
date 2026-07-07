@@ -23,10 +23,15 @@ from services.technical.indicators import candles_to_frame
 
 
 async def _trades_today(session: AsyncSession, day_start: datetime) -> tuple[int, Decimal]:
+    # FIX (2026-07-07, bug #17 CODE_REVIEW_2026-07-07.md): "hoy" se cuenta
+    # por tiempo de PROCESO (`processed_at`), no por `exit_time` (tiempo de
+    # vela) — mismo criterio que `portfolio_state._get_daily_realized_pnl_pct`,
+    # para que el resumen diario y el límite de pérdida diaria coincidan
+    # en qué cuenta como "hoy".
     stmt = (
         select(TradeExit.pnl_quote)
         .join(TradeEntry, TradeExit.trade_entry_id == TradeEntry.id)
-        .where(TradeEntry.environment == ENVIRONMENT, TradeExit.exit_time >= day_start)
+        .where(TradeEntry.environment == ENVIRONMENT, TradeExit.processed_at >= day_start)
     )
     result = await session.execute(stmt)
     pnl_quotes = [row[0] for row in result.all()]

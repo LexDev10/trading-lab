@@ -42,6 +42,7 @@ def base_portfolio() -> PortfolioSnapshot:
         system_halted_reason=None,
         asset_cooldown_active=False,
         losses_cooldown_active=False,
+        asset_has_open_position=False,
         raw={},
     )
 
@@ -98,6 +99,12 @@ def test_baseline_all_checks_pass_and_approved():
             lambda ri: dataclasses.replace(ri, min_notional=Decimal("2000")),
             lambda p: p,
             RejectionReason.exchange_filter,
+        ),
+        (
+            "no_open_position_same_asset",
+            lambda ri: ri,
+            lambda p: dataclasses.replace(p, asset_has_open_position=True),
+            RejectionReason.position_already_open,
         ),
         (
             "max_positions",

@@ -33,6 +33,7 @@ from core.schemas.decision import DecisionRecord
 from db.models import DecisionLog
 from db.session import get_session
 from journal.decision_logger import log_decision
+from notifications.telegram import send_message
 from services.data.binance_market_data import BinanceMarketData
 from services.data.persistence import upsert_asset, upsert_candles
 from services.execution import paper_ledger
@@ -210,6 +211,7 @@ async def analiza(asset: str, operar: bool) -> None:
         )
         decision_log_id = await log_decision(session, record)
 
+        open_message: str | None = None
         if would_enter_no_executor:
             assert technical_signal is not None and risk_verdict is not None and evaluation.entry_price is not None
             risk_verdict_for_entry = risk_verdict
@@ -219,7 +221,7 @@ async def analiza(asset: str, operar: bool) -> None:
                 risk_verdict_for_entry = risk_verdict_for_entry.model_copy(
                     update={"size_quote": risk_verdict_for_entry.size_quote * outcome.size_multiplier}
                 )
-            await paper_ledger.open_position(
+            _entry, open_message = await paper_ledger.open_position(
                 session,
                 settings,
                 decision_log_id=decision_log_id,
@@ -230,12 +232,17 @@ async def analiza(asset: str, operar: bool) -> None:
                 now=now,
             )
             print(
-                "\n>>> El risk engine APRUEBA esta operación: se abre una "
-                "posición de PAPEL (simulación sobre velas reales, sin "
-                "exchange). No se ha enviado ninguna orden real. <<<"
+                "\n>>> El risk engine APRUEBA esta operación: se registra una "
+                "ORDEN PENDIENTE de papel (fill simulado sobre velas reales, "
+                "sin exchange). No se ha enviado ninguna orden real. <<<"
             )
 
         await session.commit()
+
+        # FIX (2026-07-07, bug #15 CODE_REVIEW_2026-07-07.md): Telegram se
+        # envía DESPUÉS del commit, no dentro de `open_position`.
+        if open_message is not None:
+            await send_message(settings, open_message)
 
         print(f"\nfinal_action: {final_action.value}")
         print(f"rejection_reasons: {[r.value for r in evaluation.rejection_reasons]}")

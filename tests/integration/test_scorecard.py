@@ -128,3 +128,117 @@ async def test_compute_weekly_scorecard_hit_rate_and_signed_return():
     bearish_24h = by_key[("bearish_strong", "24h")]
     assert bearish_24h.hit_rate == Decimal("1.0000")
     assert bearish_24h.avg_fwd_return == pytest.approx(Decimal("0.1"), abs=Decimal("0.0001"))
+
+
+async def test_compute_weekly_scorecard_discards_horizon_without_enough_future_data():
+    """FIX (2026-07-07, bug #14 CODE_REVIEW_2026-07-07.md, punto 1): sin
+    vela real a la distancia del horizonte, el punto se descarta — antes
+    se usaba la última vela disponible como aproximación, falseando un
+    "retorno a 72h" medido en realidad sobre mucho menos tiempo."""
+    # Solo hay velas hasta +4h: los horizontes 24h/72h no tienen dato real.
+    candles = [
+        _candle(CLASSIFIED_AT, "100"),
+        _candle(CLASSIFIED_AT + timedelta(hours=4), "110"),
+    ]
+    async with get_session() as session:
+        await upsert_candles(session, candles)
+        session.add(_classification(10, "bullish_strong"))
+        await session.commit()
+
+    async with get_session() as session:
+        counts = await compute_weekly_scorecard(session, JOB_NOW)
+        await session.commit()
+
+    async with get_session() as session:
+        rows = list(
+            (
+                await session.execute(
+                    select(ClassifierScorecardRow).where(
+                        ClassifierScorecardRow.week == (THIS_WEEK_MONDAY - timedelta(days=7)).date()
+                    )
+                )
+            ).scalars()
+        )
+    horizons_present = {r.horizon for r in rows if r.stance == "bullish_strong"}
+    assert horizons_present == {"4h"}
+    assert counts["scorecard_rows"] == 1
+
+
+async def test_compute_weekly_scorecard_counts_item_for_every_tagged_asset():
+    """FIX (2026-07-07, bug #14, punto 3): un item con varios `asset_tags`
+    cuenta para CADA activo etiquetado, no solo `asset_tags[0]`."""
+    other_asset = "ZZOTHERUSDT"
+    candles_a = [_candle(CLASSIFIED_AT, "100"), _candle(CLASSIFIED_AT + timedelta(hours=4), "110")]
+    candles_b = [
+        Candle(
+            asset=other_asset, timeframe="1h", open_time=CLASSIFIED_AT, close_time=CLASSIFIED_AT + timedelta(hours=1),
+            open=Decimal("50"), high=Decimal("50"), low=Decimal("50"), close=Decimal("50"),
+            volume=Decimal("1"), quote_volume=Decimal("1"),
+        ),
+        Candle(
+            asset=other_asset, timeframe="1h", open_time=CLASSIFIED_AT + timedelta(hours=4),
+            close_time=CLASSIFIED_AT + timedelta(hours=5),
+            open=Decimal("55"), high=Decimal("55"), low=Decimal("55"), close=Decimal("55"),
+            volume=Decimal("1"), quote_volume=Decimal("1"),
+        ),
+    ]
+    async with get_session() as session:
+        await upsert_candles(session, candles_a)
+        await upsert_candles(session, candles_b)
+        item = _classification(20, "bullish_strong")
+        item.asset_tags = ["ZZTEST", "ZZOTHER"]
+        session.add(item)
+        await session.commit()
+
+    async with get_session() as session:
+        await compute_weekly_scorecard(session, JOB_NOW)
+        await session.commit()
+
+    async with get_session() as session:
+        row = (
+            await session.execute(
+                select(ClassifierScorecardRow).where(
+                    ClassifierScorecardRow.week == (THIS_WEEK_MONDAY - timedelta(days=7)).date(),
+                    ClassifierScorecardRow.stance == "bullish_strong",
+                    ClassifierScorecardRow.horizon == "4h",
+                )
+            )
+        ).scalar_one()
+    # Ambos activos suben +10% -> 2 puntos contados (no solo el primero).
+    assert row.n == 2
+
+    async with get_session() as session:
+        await session.execute(delete(CandleRow).where(CandleRow.asset == other_asset))
+        await session.commit()
+
+
+async def test_compute_weekly_scorecard_is_idempotent_on_rerun():
+    """FIX (2026-07-07, bug #14, punto 2): re-ejecutar el job para la
+    MISMA semana hace upsert, no duplica filas."""
+    candles = [_candle(CLASSIFIED_AT, "100"), _candle(CLASSIFIED_AT + timedelta(hours=4), "110")]
+    async with get_session() as session:
+        await upsert_candles(session, candles)
+        session.add(_classification(30, "bullish_strong"))
+        await session.commit()
+
+    async with get_session() as session:
+        await compute_weekly_scorecard(session, JOB_NOW)
+        await session.commit()
+    async with get_session() as session:
+        await compute_weekly_scorecard(session, JOB_NOW)
+        await session.commit()
+
+    async with get_session() as session:
+        rows = list(
+            (
+                await session.execute(
+                    select(ClassifierScorecardRow).where(
+                        ClassifierScorecardRow.week == (THIS_WEEK_MONDAY - timedelta(days=7)).date(),
+                        ClassifierScorecardRow.stance == "bullish_strong",
+                        ClassifierScorecardRow.horizon == "4h",
+                    )
+                )
+            ).scalars()
+        )
+    assert len(rows) == 1
+    assert rows[0].n == 1

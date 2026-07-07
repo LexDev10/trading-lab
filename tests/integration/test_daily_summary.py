@@ -118,6 +118,7 @@ async def test_build_daily_summary_aggregates_rejections_and_trades():
                 fees_paid=Decimal("2.1"),
                 pnl_quote=Decimal("50"),
                 pnl_pct_net=Decimal("0.05"),
+                processed_at=now,
             )
         )
         session.add(

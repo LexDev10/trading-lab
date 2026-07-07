@@ -123,6 +123,7 @@ async def test_compute_closed_trades_summary_delta_from_seeded_trade():
             TradeExit(
                 trade_entry_id=entry.id, exit_time=now, exit_price=Decimal("110"), exit_qty=Decimal("10"),
                 exit_type="closed_tp", fees_paid=Decimal("2.1"), pnl_quote=Decimal("50"), pnl_pct_net=Decimal("0.05"),
+                processed_at=now,
             )
         )
         await session.commit()

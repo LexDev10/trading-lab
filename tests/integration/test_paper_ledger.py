@@ -135,7 +135,7 @@ async def test_open_and_close_position_updates_ledger_and_portfolio_state():
 
     async with get_session() as session:
         decision_log_id = await _log_test_decision(session, now)
-        entry = await open_position(
+        entry, _open_message = await open_position(
             session,
             settings,
             decision_log_id=decision_log_id,
@@ -180,14 +180,22 @@ async def test_open_and_close_position_updates_ledger_and_portfolio_state():
                 await session.execute(select(PositionEvent).where(PositionEvent.trade_entry_id == entry_id))
             ).scalars()
         }
-        assert event_types == {"paper_open", "paper_exit"}
+        assert event_types == {"paper_pending_open", "paper_exit"}
 
         portfolio = await build_portfolio_snapshot(session, settings, TEST_ASSET, now=exit_time)
         assert portfolio.equity_quote == equity_after
 
 
 @pytest.mark.asyncio
-async def test_update_open_positions_closes_on_real_candles():
+async def test_update_open_positions_fills_pending_and_closes_on_real_candles():
+    """FIX (2026-07-07, bug #11 CODE_REVIEW_2026-07-07.md): `open_position`
+    ya no llena inmediatamente — la posición queda `pending` hasta que una
+    vela real toca la `entry_zone` (99-101, ver `_technical_signal`). Esta
+    prueba encadena: 1) una vela de pullback que llena la orden, 2) una
+    vela puente (excluida por el mismo criterio "vela de la entrada" que
+    ya aplica a las salidas, bug #5 documentado), 3) una vela que toca el
+    TP — una SOLA llamada a `update_open_positions` procesa fill + cierre
+    en la misma pasada (repregunta `open_entries` tras el autoflush)."""
     settings = get_settings()
     now = datetime.now(tz=UTC)
     technical_signal = _technical_signal(now)
@@ -196,7 +204,7 @@ async def test_update_open_positions_closes_on_real_candles():
     async with get_session() as session:
         await upsert_asset(session, TEST_ASSET)
         decision_log_id = await _log_test_decision(session, now)
-        entry = await open_position(
+        entry, _open_message = await open_position(
             session,
             settings,
             decision_log_id=decision_log_id,
@@ -207,12 +215,37 @@ async def test_update_open_positions_closes_on_real_candles():
             now=now,
         )
         entry_id = entry.id
+        assert entry.status == "pending"
 
-        candle_that_hits_tp = Candle(
+        pullback_fill_candle = Candle(
             asset=TEST_ASSET,
             timeframe="1h",
             open_time=now + timedelta(hours=1),
             close_time=now + timedelta(hours=2),
+            open=Decimal("100"),
+            high=Decimal("102"),
+            low=Decimal("98"),  # <= entry_zone_high (101): dispara el fill
+            close=Decimal("100"),
+            volume=Decimal("1000"),
+            quote_volume=Decimal("100000"),
+        )
+        bridge_candle = Candle(
+            asset=TEST_ASSET,
+            timeframe="1h",
+            open_time=now + timedelta(hours=2),
+            close_time=now + timedelta(hours=3),
+            open=Decimal("101"),
+            high=Decimal("104"),
+            low=Decimal("100"),
+            close=Decimal("103"),
+            volume=Decimal("1000"),
+            quote_volume=Decimal("100000"),
+        )
+        candle_that_hits_tp = Candle(
+            asset=TEST_ASSET,
+            timeframe="1h",
+            open_time=now + timedelta(hours=3),
+            close_time=now + timedelta(hours=4),
             open=Decimal("105"),
             high=Decimal("111"),
             low=Decimal("104"),
@@ -220,19 +253,67 @@ async def test_update_open_positions_closes_on_real_candles():
             volume=Decimal("1000"),
             quote_volume=Decimal("100000"),
         )
-        await upsert_candles(session, [candle_that_hits_tp])
+        await upsert_candles(session, [pullback_fill_candle, bridge_candle, candle_that_hits_tp])
         await session.commit()
 
     async with get_session() as session:
-        counts = await update_open_positions(session, settings, now + timedelta(hours=3))
+        counts, messages = await update_open_positions(session, settings, now + timedelta(hours=5))
         await session.commit()
-    assert counts["checked"] >= 1
+    assert counts["filled"] == 1
+    assert counts["closed"] == 1
+    assert len(messages) == 2
 
     async with get_session() as session:
         entry = await session.get(TradeEntry, entry_id)
         assert entry.status == "closed_tp"
+        assert entry.entry_price == Decimal("100")  # fill = min(zone_high=101, open=100)
         exit_row = (
             await session.execute(select(TradeExit).where(TradeExit.trade_entry_id == entry_id))
         ).scalar_one()
         assert exit_row.exit_price == Decimal("110")
         assert exit_row.exit_type == "closed_tp"
+
+
+@pytest.mark.asyncio
+async def test_update_open_positions_expires_pending_order_without_pullback():
+    """FIX (2026-07-07, bug #11): sin ninguna vela que toque la zona de
+    entrada dentro de `entry_ttl_minutes`, la orden expira — sin
+    trade_exit ni impacto en equity (nunca existió una posición real)."""
+    settings = get_settings()
+    now = datetime.now(tz=UTC)
+    technical_signal = _technical_signal(now)
+    verdict = _approved_verdict(Decimal("1000"))
+
+    async with get_session() as session:
+        await upsert_asset(session, TEST_ASSET)
+        decision_log_id = await _log_test_decision(session, now)
+        entry, _open_message = await open_position(
+            session, settings, decision_log_id=decision_log_id, asset=TEST_ASSET,
+            technical_signal=technical_signal, risk_verdict=verdict, entry_price=Decimal("100"), now=now,
+        )
+        entry_id = entry.id
+
+        # Vela que se queda muy por encima de la zona (99-101): nunca toca.
+        far_above_candle = Candle(
+            asset=TEST_ASSET, timeframe="1h", open_time=now + timedelta(hours=1),
+            close_time=now + timedelta(hours=2), open=Decimal("150"), high=Decimal("155"),
+            low=Decimal("148"), close=Decimal("152"), volume=Decimal("1000"), quote_volume=Decimal("100000"),
+        )
+        await upsert_candles(session, [far_above_candle])
+        await session.commit()
+
+    async with get_session() as session:
+        counts, messages = await update_open_positions(
+            session, settings, now + timedelta(minutes=settings.entry_ttl_minutes + 1)
+        )
+        await session.commit()
+    assert counts["expired"] == 1
+    assert len(messages) == 1
+
+    async with get_session() as session:
+        entry = await session.get(TradeEntry, entry_id)
+        assert entry.status == "expired"
+        exit_row = (
+            await session.execute(select(TradeExit).where(TradeExit.trade_entry_id == entry_id))
+        ).scalar_one_or_none()
+        assert exit_row is None

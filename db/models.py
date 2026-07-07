@@ -108,6 +108,18 @@ class TradeEntry(Base):
     timeframe: Mapped[str | None] = mapped_column(String(2), nullable=True)
     horizon_class: Mapped[str | None] = mapped_column(String(10), nullable=True)
     invalidation_level: Mapped[Decimal | None] = mapped_column(NUMERIC, nullable=True)
+    # FIX (2026-07-07, bug #11): límites de la zona de entrada de la señal
+    # (`TechnicalSignal.entry_zone`) — necesarios para `evaluate_pending_fill`
+    # mientras `status='pending'`. `entry_price`/`qty` durante el estado
+    # pending son PROVISIONALES (dimensionados contra `entry_price` teórico
+    # pasado a `open_position`); se recalculan al fill real.
+    entry_zone_low: Mapped[Decimal | None] = mapped_column(NUMERIC, nullable=True)
+    entry_zone_high: Mapped[Decimal | None] = mapped_column(NUMERIC, nullable=True)
+    # FIX (2026-07-07, bug #10): `candle_close_time` de la señal que originó
+    # esta entrada — dedupe: nunca dos `trade_entries` con el mismo
+    # (asset, timeframe, signal_candle_close_time), ver
+    # `paper_ledger.signal_already_traded`.
+    signal_candle_close_time: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
 
 
 class TradeExit(Base):
@@ -122,6 +134,12 @@ class TradeExit(Base):
     fees_paid: Mapped[Decimal] = mapped_column(NUMERIC)
     pnl_quote: Mapped[Decimal] = mapped_column(NUMERIC)
     pnl_pct_net: Mapped[Decimal] = mapped_column(NUMERIC)
+    # FIX (2026-07-07, bug #17): tiempo de PROCESO del cierre (siempre
+    # `now`, monotónico) — distinto de `exit_time` (tiempo de la vela, que
+    # puede quedar horas en el pasado). `daily_loss_limit` agrega por
+    # `processed_at`, nunca por `exit_time` (mismo criterio que el fix del
+    # bug #1 en la curva de equity)."""
+    processed_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ)
 
 
 class PositionEvent(Base):
@@ -210,6 +228,17 @@ class ItemClassification(Base):
     summary: Mapped[str] = mapped_column(Text)
     output_jsonb: Mapped[dict] = mapped_column(JSONB)
     asset_tags: Mapped[list[str]] = mapped_column(ARRAY(String), default=list)
+    # FIX (2026-07-07, bug #18 CODE_REVIEW_2026-07-07.md): `published_at`
+    # (del NewsItem/SocialItem original, desnormalizado igual que
+    # `asset_tags`) permite medir la ventana de veto desde la publicación
+    # real, no desde `classified_at` — un backlog viejo clasificado tarde
+    # ya no genera vetos "frescos" de noticias de días. `source` (p.ej.
+    # "coindesk"/"theblock"/"binance_announcements"/"reddit/Bitcoin")
+    # permite exigir corroboración de fuentes independientes distintas
+    # antes de forzar el cierre de una posición (ver
+    # `services/fundamental/veto.py::asset_has_active_closing_veto`).
+    published_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ, nullable=True)
+    source: Mapped[str | None] = mapped_column(String(60), nullable=True)
 
 
 class ClassifierScorecard(Base):

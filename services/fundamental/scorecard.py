@@ -14,13 +14,15 @@ semana que acaba de cerrar.
 # comparable entre stances bullish y bearish.
 #
 # Con cero clasificaciones todavía (clasificador recién construido), el
-# scorecard queda vacío hasta que se acumulen datos — no es un bug."""
+# scorecard queda vacío hasta que se acumulen datos — no es un bug.
+"""
 
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.schemas.market import Candle
@@ -81,40 +83,69 @@ async def compute_weekly_scorecard(session: AsyncSession, now: datetime | None =
     for item in classifications:
         if not item.asset_tags:
             continue
-        asset = f"{item.asset_tags[0]}USDT"
-        if asset not in candles_cache:
-            candles_cache[asset] = await get_all_candles(session, asset, "1h")
-        candles = candles_cache[asset]
-        if not candles:
-            continue
-
-        price_start = _price_at_or_before(candles, item.classified_at)
-        if price_start is None or price_start <= 0:
-            continue
-
-        for horizon_label, horizon_delta in HORIZONS.items():
-            price_end = _price_at_or_before(candles, item.classified_at + horizon_delta)
-            if price_end is None:
+        # FIX (2026-07-07, bug #14 CODE_REVIEW_2026-07-07.md, punto 3):
+        # iterar TODOS los `asset_tags`, no solo `asset_tags[0]` — un item
+        # puede afectar a más de un activo a la vez (p.ej. BTC y ETH).
+        for tag in item.asset_tags:
+            asset = f"{tag}USDT"
+            if asset not in candles_cache:
+                candles_cache[asset] = await get_all_candles(session, asset, "1h")
+            candles = candles_cache[asset]
+            if not candles:
                 continue
-            fwd_return = (price_end - price_start) / price_start
-            scored = _hit(item.stance, fwd_return)
-            if scored is None:
+
+            price_start = _price_at_or_before(candles, item.classified_at)
+            if price_start is None or price_start <= 0:
                 continue
-            buckets[(item.stance, horizon_label)].append(scored)
+
+            last_available_open_time = candles[-1].open_time
+            for horizon_label, horizon_delta in HORIZONS.items():
+                target_ts = item.classified_at + horizon_delta
+                if last_available_open_time < target_ts:
+                    # FIX (2026-07-07, bug #14, punto 1): sin vela
+                    # suficiente para ESTE horizonte todavía — antes se
+                    # usaba la última vela disponible como si fuera el
+                    # retorno "a 72h" aunque solo hubieran pasado 12h
+                    # reales, falseando el horizonte. Se descarta el
+                    # punto hasta que exista dato real a esa distancia.
+                    continue
+                price_end = _price_at_or_before(candles, target_ts)
+                if price_end is None:
+                    continue
+                fwd_return = (price_end - price_start) / price_start
+                scored = _hit(item.stance, fwd_return)
+                if scored is None:
+                    continue
+                buckets[(item.stance, horizon_label)].append(scored)
 
     for (stance, horizon), points in buckets.items():
         n = len(points)
         hits = sum(1 for hit, _ in points if hit)
+        hit_rate = Decimal(hits) / Decimal(n)
         avg_fwd_return = sum((signed for _, signed in points), Decimal("0")) / n
-        session.add(
-            ClassifierScorecardRow(
-                week=last_week_start.date(),
-                stance=stance,
-                horizon=horizon,
-                n=n,
-                hit_rate=Decimal(hits) / Decimal(n),
-                avg_fwd_return=avg_fwd_return,
-            )
+        # FIX (2026-07-07, bug #14, punto 2): upsert por `(week, stance,
+        # horizon)` en vez de INSERT puro — re-ejecutar el job de la
+        # misma semana (reintento manual, redeploy) ya no duplica filas.
+        # `classifier_scorecard` es una tabla DERIVADA/recalculable
+        # (única excepción a la regla append-only del almacén PIT, que
+        # solo aplica a `news_items`/`social_items`/`item_classifications`
+        # — datos primarios point-in-time, no a este agregado).
+        stmt = pg_insert(ClassifierScorecardRow).values(
+            week=last_week_start.date(),
+            stance=stance,
+            horizon=horizon,
+            n=n,
+            hit_rate=hit_rate,
+            avg_fwd_return=avg_fwd_return,
         )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[
+                ClassifierScorecardRow.week,
+                ClassifierScorecardRow.stance,
+                ClassifierScorecardRow.horizon,
+            ],
+            set_={"n": n, "hit_rate": hit_rate, "avg_fwd_return": avg_fwd_return},
+        )
+        await session.execute(stmt)
 
     return {"classifications_considered": len(classifications), "scorecard_rows": len(buckets)}

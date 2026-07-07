@@ -150,17 +150,49 @@ async def _classify_and_persist(
     title: str,
     body_text: str | None,
     asset_tags: list[str],
+    published_at: datetime | None,
+    source: str | None,
 ) -> bool:
     """Fail-closed por item (mismo criterio que `ingest_rss.ingest_all`
     fail-closed por fuente): cualquier fallo (red, JSON inválido, enum
-    fuera de esquema) se loguea y se salta ESTE item, sin tumbar el
-    batch."""
+    fuera de esquema) se loguea Y SE PERSISTE una fila neutra para ESTE
+    item, sin tumbar el batch.
+
+    # FIX (2026-07-07, bug #13 CODE_REVIEW_2026-07-07.md): antes un item
+    # que fallaba no dejaba rastro en `item_classifications`, así que
+    # volvía a seleccionarse en la siguiente corrida (`_pending_news`/
+    # `_pending_social` ordenan por `fetched_at asc` con `limit`). Un
+    # puñado de items que fallen de forma determinista (JSON inválido,
+    # enum fuera de esquema) consumía TODO el presupuesto del batch en
+    # cada corrida y ningún item nuevo se clasificaba jamás
+    # (head-of-line blocking). Persistir una fila `stance=unknown,
+    # veto=False` (neutra: no bloquea nada, no aporta stance) saca al
+    # item de "pendiente" sin violar la regla append-only del almacén PIT
+    # (una reclasificación futura, otro modelo/prompt, sigue siendo una
+    # fila nueva)."""
     try:
         prompt = build_prompt(title, body_text, asset_tags)
         raw = await call_ollama(settings, prompt)
         parsed = ParsedClassification.model_validate(raw)
-    except Exception:
+    except Exception as exc:
         logger.exception("classify.item_failed", item_kind=item_kind, item_id=item_id)
+        session.add(
+            ItemClassificationRow(
+                item_id=item_id,
+                item_kind=item_kind,
+                model_name=settings.ollama_model,
+                model_version=model_version,
+                classified_at=now,
+                stance=FundamentalStance.unknown.value,
+                event_types=[],
+                veto=False,
+                summary="classification_failed",
+                output_jsonb={"failed": True, "error": str(exc)[:500]},
+                asset_tags=asset_tags,
+                published_at=published_at,
+                source=source,
+            )
+        )
         return False
 
     session.add(
@@ -176,6 +208,8 @@ async def _classify_and_persist(
             summary=parsed.summary,
             output_jsonb=raw,
             asset_tags=asset_tags,
+            published_at=published_at,
+            source=source,
         )
     )
     return True
@@ -204,6 +238,7 @@ async def classify_pending_items(session: AsyncSession, settings: Settings, now:
         ok = await _classify_and_persist(
             session, settings, now, model_version,
             item_kind="news", item_id=item.id, title=item.title, body_text=item.body_text, asset_tags=asset_tags,
+            published_at=item.published_at, source=item.source,
         )
         counts["news" if ok else "failed"] += 1
 
@@ -216,6 +251,7 @@ async def classify_pending_items(session: AsyncSession, settings: Settings, now:
                 session, settings, now, model_version,
                 item_kind="social", item_id=social_item.id, title=social_item.title,
                 body_text=social_item.body_text, asset_tags=asset_tags,
+                published_at=social_item.published_at, source=f"reddit/{social_item.subreddit}",
             )
             counts["social" if ok else "failed"] += 1
 

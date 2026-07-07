@@ -71,9 +71,19 @@ class RejectionReason(str, Enum):
     execution_error = "execution_error"
     no_setup = "no_setup"
     sl_distance_invalid = "sl_distance_invalid"
+    # FIX (2026-07-07, bug #10 CODE_REVIEW_2026-07-07.md): ya hay una
+    # posición pendiente/abierta de papel en este activo — sin este check,
+    # la misma ruptura se re-detectaba en ciclos consecutivos y abría
+    # posiciones duplicadas.
+    position_already_open = "position_already_open"
 
 
 class TradeStatus(str, Enum):
+    # FIX (2026-07-07, bug #11): estado inicial real de toda entrada de
+    # papel — orden límite simulada a la espera de que una vela posterior
+    # toque la entry_zone (ver `paper_ledger.evaluate_pending_fill`). Antes
+    # de este fix el valor existía en el enum pero nunca se usaba: el fill
+    # era inmediato y optimista.
     pending = "pending"
     open = "open"
     closed_tp = "closed_tp"
@@ -84,6 +94,9 @@ class TradeStatus(str, Enum):
     # Valor corto a propósito: trade_entries.status/trade_exits.exit_type
     # son String(20) — "closed_fundamental_veto" (24 chars) no entra.
     closed_fundamental_veto = "closed_veto"
+    # FIX (2026-07-07, bug #11): la orden pendiente no se llenó dentro de
+    # `ENTRY_TTL_MINUTES` — se cancela, sin trade_exit ni impacto en equity.
+    expired = "expired"
     error = "error"
 
 

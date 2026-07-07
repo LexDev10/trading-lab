@@ -67,7 +67,18 @@ def test_generate_signals_produces_known_entry():
 def test_simulate_trades_hits_take_profit_when_no_earlier_exit():
     """Tras la ruptura, sube de forma lineal y estable hasta tocar TP sin
     que la invalidación ni el SL disparen antes — mismo camino "limpio"
-    del backtest original, ahora con el motor de salidas realista."""
+    del backtest original, ahora con el motor de salidas realista.
+
+    # FIX (2026-07-07, bug #11 CODE_REVIEW_2026-07-07.md): la entrada ya
+    # no es inmediata a `entry_ref` (108.0) — es un FILL de orden límite
+    # simulada. La vela 71 (open=100.0, leftover del fixture base: `open`
+    # se fija UNA vez sobre el close original antes de que este test
+    # sobrescriba `close`) abre ya por debajo de `entry_zone_high` (115),
+    # así que llena al open (100.0), no al límite. Y como
+    # `entry_ttl_minutes` (45) es menor que 1h, el fill se registra en el
+    # deadline del TTL (23:45), no en el close de la vela 71 (00:00) — ver
+    # `paper_ledger.evaluate_pending_fill`. Valores verificados ejecutando
+    # `simulate_trades` sobre este fixture (no recalculados a mano)."""
     df = _base_fixture()
     for i in range(71, 94):
         df.loc[df.index[i], "close"] = 115.0 + (i - 70) * 1.0
@@ -86,16 +97,13 @@ def test_simulate_trades_hits_take_profit_when_no_earlier_exit():
 
     assert len(trades) == 1
     trade = trades.iloc[0]
-    # Entry Timestamp = close_time de la vela de ruptura (vela 70), no su
-    # open_time: mismo criterio que `entry.entry_time` en el paper ledger
-    # (la vela de la propia entrada queda excluida del seguimiento).
-    assert trade["Entry Timestamp"] == pd.Timestamp("2024-01-03 23:00:00", tz="UTC")
+    assert trade["Entry Timestamp"] == pd.Timestamp("2024-01-03 23:45:00", tz="UTC")
     assert trade["Exit Timestamp"] == pd.Timestamp("2024-01-04 12:00:00", tz="UTC")
     assert trade["exit_type"] == "closed_tp"
-    assert trade["Avg Entry Price"] == pytest.approx(108.0, rel=1e-6)
+    assert trade["Avg Entry Price"] == pytest.approx(100.0, rel=1e-6)
     assert trade["Avg Exit Price"] == pytest.approx(129.0, rel=1e-6)
-    assert trade["sl_pct_at_entry"] == pytest.approx(0.09722222, rel=1e-6)
-    assert trade["Return"] == pytest.approx(0.191773, rel=1e-4)
+    assert trade["sl_pct_at_entry"] == pytest.approx(0.025, rel=1e-6)
+    assert trade["Return"] == pytest.approx(0.287195, rel=1e-4)
 
 
 def test_simulate_trades_hits_invalidation_before_sl_or_tp():
@@ -103,7 +111,11 @@ def test_simulate_trades_hits_invalidation_before_sl_or_tp():
     `invalidation_level` unas velas y luego cierra por debajo — sin tocar
     ni el SL ni el TP. Prueba que `simulate_trades` reutiliza de verdad
     `evaluate_exit` (bug #4): el viejo motor basado solo en `vectorbt`
-    SL/TP nunca habría cerrado este trade."""
+    SL/TP nunca habría cerrado este trade.
+
+    # FIX (2026-07-07, bug #11): mismo fill al open de la vela 71 (100.0)
+    # que el test anterior — ver su comentario. Valores verificados
+    # ejecutando `simulate_trades`, no recalculados a mano."""
     df = _base_fixture()
     for i in range(71, 76):
         df.loc[df.index[i], ["close", "high", "low"]] = [107.0, 110.0, 104.0]
@@ -116,11 +128,12 @@ def test_simulate_trades_hits_invalidation_before_sl_or_tp():
 
     assert len(trades) == 1
     trade = trades.iloc[0]
-    assert trade["Entry Timestamp"] == pd.Timestamp("2024-01-03 23:00:00", tz="UTC")
+    assert trade["Entry Timestamp"] == pd.Timestamp("2024-01-03 23:45:00", tz="UTC")
     assert trade["Exit Timestamp"] == pd.Timestamp("2024-01-04 05:00:00", tz="UTC")
     assert trade["exit_type"] == "closed_invalidated"
+    assert trade["Avg Entry Price"] == pytest.approx(100.0, rel=1e-6)
     assert trade["Avg Exit Price"] == pytest.approx(98.5, rel=1e-6)
-    assert trade["Return"] == pytest.approx(-0.090239, rel=1e-4)
+    assert trade["Return"] == pytest.approx(-0.017379, rel=1e-4)
     assert trade["Return"] < 0
 
 

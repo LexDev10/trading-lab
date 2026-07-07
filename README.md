@@ -299,7 +299,13 @@ docker compose exec app uv run alembic upgrade head
   de posiciones corre a la cadencia de 15 min del ciclo existente en vez
   de los 5 min de la sección 11 (pensados para el monitor real). El veto
   fundamental (fase 2) SÍ está integrado, ver sección "Meta-decider +
-  dashboard" arriba. Detalle completo en
+  dashboard" arriba. **Modelo de fill corregido el 2026-07-07** (bug #11,
+  ver `CLAUDE.md`): toda entrada aprobada por el risk engine se registra
+  primero como orden PENDIENTE (`status='pending'`) y solo pasa a
+  `open` cuando una vela real toca la zona de entrada dentro de
+  `ENTRY_TTL_MINUTES` — antes llenaba de inmediato al precio teórico
+  `entry_ref`, un precio que el mercado nunca confirmaba (sesgo
+  sistemático a favor en una estrategia de breakout). Detalle completo en
   `services/execution/paper_ledger.py`.
 - No hay claves de Binance configuradas; no hacen falta para lo que existe
   hoy (los datos usados son endpoints públicos de solo lectura).
@@ -331,10 +337,20 @@ docker compose exec app uv run alembic upgrade head
   IS/OOS del walk-forward comparten 1 vela de frontera (`df.loc`
   inclusivo); la frescura de datos del scanner solo se comprueba sobre
   velas 1h.
+- **Corrección de 9 bugs adicionales el 2026-07-07** (posiciones
+  duplicadas, fill optimista, orden del ciclo, clasificador bloqueado,
+  scorecard, notificaciones fantasma, veto pisando salidas, pérdida
+  diaria por tiempo de vela, veto LLM sin corroboración) — detalle
+  completo en `docs/CODE_REVIEW_2026-07-07.md` y `CLAUDE.md`. El
+  histórico de paper trading se purgó (base de datos reiniciada) porque
+  los datos previos se generaron con los bugs de posiciones
+  duplicadas/fill optimista/orden del ciclo activos.
 - Fase 2 (capa fundamental) está casi cerrada: almacén PIT + ingesta
-  RSS/JSON + clasificador Ollama + veto fundamental (bloquea entradas y
-  cierra posiciones) + scorecard semanal, todos funcionando y verificados
-  en producción. Sigue pendiente Reddit: `REDDIT_CLIENT_ID`/`SECRET`
+  RSS/JSON + clasificador Ollama + veto fundamental (bloquea entradas
+  siempre; cierra posiciones solo con corroboración de ≥2 fuentes `news`
+  independientes desde el fix del 2026-07-07, ver `CLAUDE.md` bug #18) +
+  scorecard semanal, todos funcionando y verificados en producción.
+  Sigue pendiente Reddit: `REDDIT_CLIENT_ID`/`SECRET`
   siguen vacíos (el registro de la app en reddit.com/prefs/apps quedó
   bloqueado por el propio proceso de verificación de desarrollador de
   Reddit, fuera de nuestro control), así que esa fuente no aporta items

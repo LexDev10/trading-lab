@@ -56,25 +56,38 @@ async def _ingest_market_data(now: datetime) -> None:
 
 
 async def _scan_cycle(now: datetime) -> None:
+    """FIX (2026-07-07, bug #15 CODE_REVIEW_2026-07-07.md): las alertas de
+    Telegram se envían DESPUÉS de `session.commit()` — antes, `run_scan_cycle`
+    las enviaba dentro del bucle; si el ciclo fallaba a mitad de universo,
+    el rollback revertía posiciones cuyas alertas ya habían salido
+    (notificaciones fantasma)."""
     settings = get_settings()
     log = logger.bind(job="scan_cycle", started_at=now.isoformat())
     log.info("job.start")
 
     async with get_session() as session:
-        counts = await run_scan_cycle(session, settings, now=now)
+        counts, messages = await run_scan_cycle(session, settings, now=now)
         await session.commit()
+
+    for message in messages:
+        await send_message(settings, message)
 
     log.info("job.success", **counts)
 
 
 async def _update_paper_positions(now: datetime) -> None:
+    """FIX (2026-07-07, bug #15): mismo criterio que `_scan_cycle` —
+    Telegram se envía tras el commit, no dentro del procesamiento."""
     settings = get_settings()
     log = logger.bind(job="paper_positions", started_at=now.isoformat())
     log.info("job.start")
 
     async with get_session() as session:
-        counts = await update_open_positions(session, settings, now)
+        counts, messages = await update_open_positions(session, settings, now)
         await session.commit()
+
+    for message in messages:
+        await send_message(settings, message)
 
     log.info("job.success", **counts)
 
@@ -155,11 +168,20 @@ async def daily_summary_job() -> None:
 
 async def market_cycle_job() -> None:
     """Ingesta velas 1h/4h y ticker 24h para todo el universo (idempotente,
-    un fallo a mitad de ciclo se corrige solo en el siguiente run), corre el
-    scanner+técnico+risk engine (`trigger=scheduled`) sobre datos ya frescos
-    y, por último, sigue las posiciones de papel abiertas (sección 11,
-    simplificado a esta misma cadencia — ver `services/execution/
-    paper_ledger.py`)."""
+    un fallo a mitad de ciclo se corrige solo en el siguiente run), sigue
+    las posiciones de papel abiertas (fills pendientes + salidas, sección
+    11) y SOLO DESPUÉS corre el scanner+técnico+risk engine
+    (`trigger=scheduled`) sobre datos ya frescos.
+
+    # FIX (2026-07-07, bug #12 CODE_REVIEW_2026-07-07.md): el orden
+    # anterior (scan ANTES de procesar cierres) evaluaba `daily_loss_limit`,
+    # `drawdown_killswitch` y el cooldown de 2 SL con el estado de cartera
+    # previo a cierres que ya estaban en las velas recién ingeridas — dos
+    # SL tocados en la última hora no bloqueaban una entrada nueva en ese
+    # mismo ciclo porque el scan corría antes de registrarlos. Invertido:
+    # cerrar primero, escanear después, siempre con el estado de cartera
+    # ya actualizado. Fail-closed escalonado: si los cierres fallan, no se
+    # escanea (mejor no abrir con estado de cartera desconocido)."""
     started_at = datetime.now(tz=UTC)
     log = logger.bind(job="market_cycle", started_at=started_at.isoformat())
 
@@ -173,15 +195,17 @@ async def market_cycle_job() -> None:
         return
 
     try:
-        await _scan_cycle(started_at)
+        await _update_paper_positions(started_at)
     except Exception:
-        log.exception("scan.failed")
+        # Fail-closed: si no se sabe si hubo cierres, no escanear con un
+        # estado de cartera potencialmente desactualizado.
+        log.exception("paper_positions.failed")
         return
 
     try:
-        await _update_paper_positions(started_at)
+        await _scan_cycle(started_at)
     except Exception:
-        log.exception("paper_positions.failed")
+        log.exception("scan.failed")
         return
 
     duration_s = (datetime.now(tz=UTC) - started_at).total_seconds()

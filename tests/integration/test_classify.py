@@ -120,7 +120,13 @@ async def test_classify_pending_items_persists_and_is_idempotent(monkeypatch):
     assert news_id not in pending_ids
 
 
-async def test_classify_pending_items_skips_item_on_bad_model_output(monkeypatch):
+async def test_classify_pending_items_persists_failed_item_and_stops_retrying(monkeypatch):
+    """FIX (2026-07-07, bug #13 CODE_REVIEW_2026-07-07.md): un item cuyo
+    output del modelo no valida (enum fuera de esquema) ya NO queda
+    "pendiente" para siempre (antes: head-of-line blocking, consumía todo
+    el presupuesto del batch en cada corrida) — se persiste una fila
+    neutra (`stance=unknown`, `veto=False`) y el item deja de aparecer en
+    `_pending_news`."""
     item = NewsItem(
         source=TEST_SOURCE,
         source_url=None,
@@ -135,6 +141,9 @@ async def test_classify_pending_items_skips_item_on_bad_model_output(monkeypatch
     async with get_session() as session:
         await persist_news_items(session, [item])
         await session.commit()
+        news_id = (
+            await session.execute(select(NewsItemRow.id).where(NewsItemRow.content_hash == item.content_hash))
+        ).scalar_one()
 
     async def fake_get_model_version(settings: Settings) -> str:
         return "test-version"
@@ -151,3 +160,20 @@ async def test_classify_pending_items_skips_item_on_bad_model_output(monkeypatch
 
     assert counts["news"] == 0
     assert counts["failed"] == 1
+
+    async with get_session() as session:
+        stmt = select(ItemClassificationRow).where(
+            ItemClassificationRow.item_kind == "news", ItemClassificationRow.item_id == news_id
+        )
+        rows = list((await session.execute(stmt)).scalars())
+    assert len(rows) == 1
+    assert rows[0].stance == "unknown"
+    assert rows[0].veto is False
+    assert rows[0].summary == "classification_failed"
+    assert rows[0].output_jsonb["failed"] is True
+
+    # El item ya no está "pendiente": no vuelve a consumir presupuesto del
+    # batch en corridas futuras (antes de este fix, sí — head-of-line blocking).
+    async with get_session() as session:
+        pending_ids = [row.id for row in await classify._pending_news(session, limit=1000)]
+    assert news_id not in pending_ids

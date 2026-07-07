@@ -10,7 +10,7 @@ from decimal import Decimal
 from app.config import Settings
 from core.schemas.market import Candle
 from db.models import TradeEntry
-from services.execution.paper_ledger import evaluate_exit
+from services.execution.paper_ledger import evaluate_exit, evaluate_pending_fill
 
 ENTRY_TIME = datetime(2026, 1, 1, tzinfo=UTC)
 
@@ -176,12 +176,91 @@ def test_veto_active_falls_back_to_entry_price_without_any_candle():
     assert decision.exit_price == entry.entry_price
 
 
-def test_veto_active_wins_over_sl_touch():
-    """Un veto es más urgente que esperar a que toque el SL: si ambos
-    aplicarían, gana el veto."""
+def test_sl_touch_wins_over_veto_active():
+    """FIX (2026-07-07, bug #16 CODE_REVIEW_2026-07-07.md): si una vela
+    CERRADA anterior ya tocó el SL, el veto ya no lo pisa — el exit
+    registrado es el que realmente ocurrió primero en el tiempo (antes de
+    este fix, el veto ganaba siempre, distorsionando PnL y exit_type)."""
     entry = base_entry()
     now = ENTRY_TIME + timedelta(hours=2)
     candles = [make_candle(ENTRY_TIME + timedelta(hours=1), low="90", high="101", close="94")]
     decision = evaluate_exit(entry, candles, base_settings(), now, veto_active=True)
     assert decision is not None
+    assert decision.exit_type == "closed_sl"
+    assert decision.exit_price == entry.sl
+
+
+def test_veto_active_still_closes_when_no_earlier_exit_triggered():
+    """El veto sigue siendo más urgente que la salida por tiempo: cierra
+    de inmediato si NINGUNA vela cerrada disparó SL/TP/invalidación."""
+    entry = base_entry()
+    now = ENTRY_TIME + timedelta(hours=2)
+    candles = [make_candle(ENTRY_TIME + timedelta(hours=1), low="99", high="105", close="102")]
+    decision = evaluate_exit(entry, candles, base_settings(), now, veto_active=True)
+    assert decision is not None
     assert decision.exit_type == "closed_veto"
+
+
+def base_pending_entry(**overrides) -> TradeEntry:
+    """FIX (2026-07-07, bug #11 CODE_REVIEW_2026-07-07.md): entrada en
+    `status='pending'` — `entry_zone_high` es el límite superior de la
+    zona (el precio de la orden límite simulada)."""
+    defaults = dict(entry_time=ENTRY_TIME, entry_zone_high=Decimal("115"), sl=Decimal("95"))
+    defaults.update(overrides)
+    return TradeEntry(**defaults)
+
+
+def test_pending_fill_no_touch_returns_none():
+    entry = base_pending_entry()
+    assert entry.entry_zone_high is not None
+    candles = [make_candle(ENTRY_TIME + timedelta(hours=1), low="118", high="122", close="120")]
+    now = ENTRY_TIME + timedelta(hours=1, minutes=30)
+    assert evaluate_pending_fill(entry, candles, base_settings(), now) is None
+
+
+def test_pending_fill_immediate_next_candle_counts_even_in_progress():
+    """FIX (2026-07-07): a diferencia de `evaluate_exit`, la vela
+    INMEDIATAMENTE siguiente a la señal SÍ cuenta (open_time == entry_time)
+    y NO hace falta que haya cerrado — necesario porque
+    `entry_ttl_minutes` (45 por defecto) es menor que cualquier timeframe
+    operado (1h/4h): exigir el cierre haría que la orden expirase
+    siempre."""
+    entry = base_pending_entry()
+    assert entry.entry_zone_high is not None
+    # Vela que arranca justo en entry_time (open_time == ENTRY_TIME) y
+    # AÚN NO ha cerrado (close_time > now) — debe admitirse igualmente.
+    candle = Candle(
+        asset="SOLUSDT", timeframe="1h", open_time=ENTRY_TIME, close_time=ENTRY_TIME + timedelta(hours=1),
+        open=Decimal("118"), high=Decimal("120"), low=Decimal("112"), close=Decimal("114"),
+        volume=Decimal("1000"), quote_volume=Decimal("100000"),
+    )
+    now = ENTRY_TIME + timedelta(minutes=30)
+    fill = evaluate_pending_fill(entry, [candle], base_settings(), now)
+    assert fill is not None
+    # low(112) <= entry_zone_high(115): toca la zona. Precio de fill =
+    # min(zone_high, open) = min(115, 118) = 115 (el límite, no el open,
+    # porque el open está POR ENCIMA del límite).
+    assert fill.fill_price == Decimal("115")
+    # La vela no ha cerrado todavía -> fill_time se acota a `now`, nunca al futuro.
+    assert fill.fill_time == now
+
+
+def test_pending_fill_price_uses_open_when_gaps_below_zone():
+    entry = base_pending_entry()
+    assert entry.entry_zone_high is not None
+    candle = make_candle(ENTRY_TIME + timedelta(hours=1), low="108", high="112", close="110")
+    # `make_candle` fija open == close == "110": el open (110) está POR
+    # DEBAJO del límite (115) -> fill al open, no al límite.
+    now = ENTRY_TIME + timedelta(hours=2)
+    fill = evaluate_pending_fill(entry, [candle], base_settings(), now)
+    assert fill is not None
+    assert fill.fill_price == Decimal("110")
+    assert fill.fill_time == candle.close_time  # esta vela sí cerró antes de `now`
+
+
+def test_pending_fill_ignores_candle_before_entry_time():
+    entry = base_pending_entry()
+    assert entry.entry_zone_high is not None
+    candle = make_candle(ENTRY_TIME - timedelta(hours=1), low="90", high="120", close="110")
+    now = ENTRY_TIME + timedelta(hours=1)
+    assert evaluate_pending_fill(entry, [candle], base_settings(), now) is None

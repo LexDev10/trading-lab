@@ -31,7 +31,6 @@ from core.schemas.risk import RiskVerdict
 from core.schemas.technical import TechnicalSignal
 from db.models import RegimeLog
 from journal.decision_logger import log_decision
-from notifications.telegram import send_message
 from services.data.binance_market_data import BinanceMarketData
 from services.data.persistence import get_latest_snapshot, get_recent_candles
 from services.decision.policy import PolicyOutcome, apply_fundamental_policy
@@ -211,15 +210,27 @@ def decide_final_action(
     return FinalAction.watchlist, True
 
 
-async def run_scan_cycle(session: AsyncSession, settings: Settings, now: datetime | None = None) -> dict[str, int]:
+async def run_scan_cycle(
+    session: AsyncSession, settings: Settings, now: datetime | None = None
+) -> tuple[dict[str, int], list[str]]:
     """Ciclo automático (`trigger=scheduled`) sobre todo `UNIVERSE`. Lee
     velas/snapshots YA persistidos por `ingest_market_data_job` — no
     vuelve a golpear la API de Binance salvo para `exchangeInfo`
     (min_notional), que solo se pide cuando hay un setup real.
 
     Se comporta como el modo "operar" de `/analiza`: si el risk engine
-    aprueba, se abre una posición de PAPEL (sin exchange real, ver
-    `services/execution/paper_ledger.py`) y se registra `final_action=enter`."""
+    aprueba, se registra una orden PENDIENTE de papel (sin exchange real,
+    ver `services/execution/paper_ledger.py`) y se registra
+    `final_action=enter`.
+
+    # FIX (2026-07-07, bug #15 CODE_REVIEW_2026-07-07.md): la evaluación
+    # de cada activo va envuelta en try/except — un fallo en UN activo
+    # (p.ej. `exchangeInfo` caído para ese símbolo) ya no tumba la
+    # evaluación del resto del universo. Devuelve `(counts, messages)`: los
+    # mensajes de Telegram NO se envían aquí, el CALLER (scheduler) los
+    # envía DESPUÉS de `session.commit()` — antes, un fallo a mitad de
+    # universo revertía posiciones de activos anteriores cuyas alertas ya
+    # habían salido (notificaciones fantasma)."""
     now = now or datetime.now(tz=UTC)
     client = BinanceMarketData()
     git_sha = get_git_sha()
@@ -227,6 +238,7 @@ async def run_scan_cycle(session: AsyncSession, settings: Settings, now: datetim
     log.info("cycle.start", universe_size=len(settings.universe_list))
 
     counts = {"enter_would": 0, "reject": 0, "watchlist_no_signal": 0}
+    messages: list[str] = []
 
     btc_4h = await get_recent_candles(session, BTC_ASSET, "4h", 500)
     btc_4h_df = candles_to_frame(btc_4h, now=now)
@@ -253,95 +265,140 @@ async def run_scan_cycle(session: AsyncSession, settings: Settings, now: datetim
             counts["reject"] += 1
             continue
 
-        asset_1h_df = candles_to_frame(asset_1h, now=now)
-        asset_4h_df = candles_to_frame(asset_4h, now=now)
+        try:
+            asset_1h_df = candles_to_frame(asset_1h, now=now)
+            asset_4h_df = candles_to_frame(asset_4h, now=now)
 
-        evaluation = await evaluate_asset(
-            session=session,
-            client=client,
-            asset=asset,
-            asset_1h_df=asset_1h_df,
-            asset_4h_df=asset_4h_df,
-            snapshot=snapshot,
-            regime=regime,
-            regime_blocks=regime_blocks,
-            settings=settings,
-            now=now,
-        )
-
-        final_action, would_enter_no_executor = decide_final_action(
-            "operate", evaluation.technical_signal, evaluation.risk_verdict, evaluation.policy_outcome
-        )
-        if would_enter_no_executor:
-            final_action = FinalAction.enter
-            counts["enter_would"] += 1
-        elif final_action == FinalAction.reject:
-            counts["reject"] += 1
-        else:
-            counts["watchlist_no_signal"] += 1
-
-        technical_signal = evaluation.technical_signal
-        decision_payload: dict[str, Any] | None = None
-        if evaluation.policy_outcome is not None:
-            decision_payload = {
-                "fundamental_stance": evaluation.fundamental_stance.value if evaluation.fundamental_stance else None,
-                "policy_action": evaluation.policy_outcome.action,
-                "size_multiplier": str(evaluation.policy_outcome.size_multiplier),
-            }
-        record = DecisionRecord(
-            ts=now,
-            mode=settings.mode,
-            trigger=Trigger.scheduled,
-            asset=asset,
-            git_sha=git_sha,
-            scanner=evaluation.scanner_payload,
-            technical=technical_signal.model_dump(mode="json") if technical_signal else None,
-            decision=decision_payload,
-            risk_verdict=evaluation.risk_verdict.model_dump(mode="json") if evaluation.risk_verdict else None,
-            final_action=final_action,
-            rejection_reasons=evaluation.rejection_reasons,
-            expected_tp=technical_signal.take_profit if technical_signal else None,
-            expected_sl=technical_signal.stop_loss if technical_signal else None,
-            horizon_class=technical_signal.horizon_class if technical_signal else None,
-        )
-        decision_log_id = await log_decision(session, record)
-
-        if would_enter_no_executor:
-            assert technical_signal is not None and evaluation.risk_verdict is not None and evaluation.entry_price is not None
-            risk_verdict_for_entry = evaluation.risk_verdict
-            outcome = evaluation.policy_outcome
-            if outcome is not None and outcome.action == "enter" and outcome.size_multiplier != Decimal("1"):
-                assert risk_verdict_for_entry.size_quote is not None
-                risk_verdict_for_entry = risk_verdict_for_entry.model_copy(
-                    update={"size_quote": risk_verdict_for_entry.size_quote * outcome.size_multiplier}
-                )
-            await paper_ledger.open_position(
-                session,
-                settings,
-                decision_log_id=decision_log_id,
+            evaluation = await evaluate_asset(
+                session=session,
+                client=client,
                 asset=asset,
-                technical_signal=technical_signal,
-                risk_verdict=risk_verdict_for_entry,
-                entry_price=evaluation.entry_price,
+                asset_1h_df=asset_1h_df,
+                asset_4h_df=asset_4h_df,
+                snapshot=snapshot,
+                regime=regime,
+                regime_blocks=regime_blocks,
+                settings=settings,
                 now=now,
             )
-            log.info("cycle.paper_open", asset=asset, decision_log_id=decision_log_id)
 
-            # Memo LLM opcional (sección 13) — solo en modo "full", y solo
-            # redacta, nunca decide (la posición ya se abrió arriba). No-op
-            # sin USE_REMOTE_LLM/API key (ver services/reporting/llm_memo.py).
-            if settings.mode == "full":
-                memo = await generate_trade_memo(
-                    settings,
-                    {
-                        "asset": asset,
-                        "technical": technical_signal.model_dump(mode="json"),
-                        "decision": decision_payload,
-                        "risk_verdict": risk_verdict_for_entry.model_dump(mode="json"),
-                    },
+            final_action, would_enter_no_executor = decide_final_action(
+                "operate", evaluation.technical_signal, evaluation.risk_verdict, evaluation.policy_outcome
+            )
+
+            # FIX (2026-07-07, bug #10): segunda capa de dedupe — nunca
+            # abrir dos veces sobre la MISMA vela de señal (el check de
+            # cartera `asset_has_open_position` del risk engine ya cubre
+            # el caso general de "posición ya pendiente/abierta", esto
+            # cubre el residual de una posición cerrada dentro del mismo
+            # ciclo de escaneo).
+            if would_enter_no_executor and evaluation.technical_signal is not None:
+                already_traded = await paper_ledger.signal_already_traded(
+                    session,
+                    asset,
+                    evaluation.technical_signal.timeframe,
+                    evaluation.technical_signal.candle_close_time,
                 )
-                if memo is not None:
-                    await send_message(settings, f"📝 <b>Memo</b> {asset}\n{memo}")
+                if already_traded:
+                    would_enter_no_executor = False
+                    final_action = FinalAction.reject
+                    evaluation.rejection_reasons.append(RejectionReason.position_already_open)
+
+            if would_enter_no_executor:
+                final_action = FinalAction.enter
+                counts["enter_would"] += 1
+            elif final_action == FinalAction.reject:
+                counts["reject"] += 1
+            else:
+                counts["watchlist_no_signal"] += 1
+
+            technical_signal = evaluation.technical_signal
+            decision_payload: dict[str, Any] | None = None
+            if evaluation.policy_outcome is not None:
+                decision_payload = {
+                    "fundamental_stance": evaluation.fundamental_stance.value if evaluation.fundamental_stance else None,
+                    "policy_action": evaluation.policy_outcome.action,
+                    "size_multiplier": str(evaluation.policy_outcome.size_multiplier),
+                }
+            record = DecisionRecord(
+                ts=now,
+                mode=settings.mode,
+                trigger=Trigger.scheduled,
+                asset=asset,
+                git_sha=git_sha,
+                scanner=evaluation.scanner_payload,
+                technical=technical_signal.model_dump(mode="json") if technical_signal else None,
+                decision=decision_payload,
+                risk_verdict=evaluation.risk_verdict.model_dump(mode="json") if evaluation.risk_verdict else None,
+                final_action=final_action,
+                rejection_reasons=evaluation.rejection_reasons,
+                expected_tp=technical_signal.take_profit if technical_signal else None,
+                expected_sl=technical_signal.stop_loss if technical_signal else None,
+                horizon_class=technical_signal.horizon_class if technical_signal else None,
+            )
+            decision_log_id = await log_decision(session, record)
+
+            if would_enter_no_executor:
+                assert (
+                    technical_signal is not None
+                    and evaluation.risk_verdict is not None
+                    and evaluation.entry_price is not None
+                )
+                risk_verdict_for_entry = evaluation.risk_verdict
+                outcome = evaluation.policy_outcome
+                if outcome is not None and outcome.action == "enter" and outcome.size_multiplier != Decimal("1"):
+                    assert risk_verdict_for_entry.size_quote is not None
+                    risk_verdict_for_entry = risk_verdict_for_entry.model_copy(
+                        update={"size_quote": risk_verdict_for_entry.size_quote * outcome.size_multiplier}
+                    )
+                _entry, open_message = await paper_ledger.open_position(
+                    session,
+                    settings,
+                    decision_log_id=decision_log_id,
+                    asset=asset,
+                    technical_signal=technical_signal,
+                    risk_verdict=risk_verdict_for_entry,
+                    entry_price=evaluation.entry_price,
+                    now=now,
+                )
+                messages.append(open_message)
+                log.info("cycle.paper_pending_open", asset=asset, decision_log_id=decision_log_id)
+
+                # Memo LLM opcional (sección 13) — solo en modo "full", y
+                # solo redacta, nunca decide (la orden ya se registró
+                # arriba). No-op sin USE_REMOTE_LLM/API key (ver
+                # services/reporting/llm_memo.py).
+                if settings.mode == "full":
+                    memo = await generate_trade_memo(
+                        settings,
+                        {
+                            "asset": asset,
+                            "technical": technical_signal.model_dump(mode="json"),
+                            "decision": decision_payload,
+                            "risk_verdict": risk_verdict_for_entry.model_dump(mode="json"),
+                        },
+                    )
+                    if memo is not None:
+                        messages.append(f"📝 <b>Memo</b> {asset}\n{memo}")
+        except Exception:
+            # FIX (2026-07-07, bug #15): un fallo evaluando ESTE activo
+            # (red, exchangeInfo, lo que sea) no debe tumbar el resto del
+            # universo ni dejar a medias una posición de un activo
+            # anterior — se registra como rechazo y se continúa.
+            log.exception("cycle.asset_failed", asset=asset)
+            record = DecisionRecord(
+                ts=now,
+                mode=settings.mode,
+                trigger=Trigger.scheduled,
+                asset=asset,
+                git_sha=git_sha,
+                scanner={"reason": "asset_evaluation_failed"},
+                final_action=FinalAction.reject,
+                rejection_reasons=[RejectionReason.execution_error],
+            )
+            await log_decision(session, record)
+            counts["reject"] += 1
+            continue
 
     log.info("cycle.success", **counts)
-    return counts
+    return counts, messages

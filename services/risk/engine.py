@@ -96,6 +96,17 @@ def evaluate_risk(
 
     # --- 9.2 checks de cartera ---
 
+    # FIX (2026-07-07, bug #10 CODE_REVIEW_2026-07-07.md): sin este check
+    # la misma ruptura se re-detectaba en ciclos consecutivos (scan cada
+    # 15 min, velas cada 1h/4h) y abría posiciones duplicadas en el mismo
+    # activo hasta chocar con max_positions/exposición. Los cooldowns solo
+    # miran `trade_exits` (salidas) — no protegen mientras la posición
+    # sigue pendiente/abierta.
+    no_open_position_ok = not portfolio.asset_has_open_position
+    checks["no_open_position_same_asset"] = no_open_position_ok
+    if not no_open_position_ok:
+        reasons.append(RejectionReason.position_already_open)
+
     max_positions_ok = portfolio.open_positions < settings.max_positions
     checks["max_positions"] = max_positions_ok
     if not max_positions_ok:

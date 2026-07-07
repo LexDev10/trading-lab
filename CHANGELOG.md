@@ -3,6 +3,85 @@
 Registro cronológico de lo implementado en el proyecto. Formato:
 `[YYYY-MM-DD HH:MM] Descripción`.
 
+## 2026-07-07
+
+- **[2026-07-07]** **Corrección de los bugs #10-#18 de
+  `docs/CODE_REVIEW_2026-07-07.md`** (revisión de código posterior a la
+  del 2026-07-06). Migraciones nuevas: `0007_pending_fill_dedupe_processed_at`,
+  `0008_veto_published_at_source`, `0009_scorecard_unique_constraint`.
+  Verificado en Docker: 128 unit + 25 integration tests, todos en verde;
+  mypy sin categorías de error nuevas (el resto es la misma deuda
+  preexistente de anotaciones en tests, documentada el 2026-07-06).
+
+  - **Bug #10 (posiciones duplicadas)**: `PortfolioSnapshot` gana
+    `asset_has_open_position`; nuevo check
+    `checks["no_open_position_same_asset"]` en el risk engine
+    (`RejectionReason.position_already_open`, nuevo). Segunda capa:
+    columna `trade_entries.signal_candle_close_time` +
+    `paper_ledger.signal_already_traded` — el scanner nunca vuelve a
+    abrir sobre la MISMA vela de ruptura.
+  - **Bug #11 (fill optimista)**: `open_position` ya NO llena
+    inmediatamente a `entry_ref` — registra una orden `status='pending'`
+    (columnas nuevas `entry_zone_low`/`entry_zone_high`). Función nueva
+    `paper_ledger.evaluate_pending_fill` decide el fill vela a vela
+    contra la `entry_zone`, respetando `ENTRY_TTL_MINUTES` (existía en
+    `Settings` desde el origen del proyecto pero nunca se usó). Estado
+    nuevo `TradeStatus.expired` si no hay fill dentro del TTL. El
+    backtest (`strategy_breakout.py::simulate_trades`) reutiliza la
+    MISMA función (regla sección 6) — la expectancy de
+    `backtests/RESULTS.md` queda desactualizada por este fix y debe
+    recalcularse antes de fiarse de ella para decisiones.
+    **DECISION documentada en el código**: `ENTRY_TTL_MINUTES` (45) es
+    menor que cualquier timeframe operado (1h/4h) — `evaluate_pending_fill`
+    admite deliberadamente la vela EN CURSO (a diferencia de
+    `evaluate_exit`), o ningún fill ocurriría jamás.
+  - **Bug #12 (orden del ciclo)**: `market_cycle_job` ahora procesa
+    cierres (`update_open_positions`) ANTES de escanear nuevas entradas
+    (`run_scan_cycle`) — antes al revés, así que el estado de cartera que
+    veía el risk engine (cooldown de 2 SL, pérdida diaria) no reflejaba
+    cierres ya ocurridos en el mismo ciclo.
+  - **Bug #13 (clasificador bloqueado)**: `classify.py` persiste ahora una
+    fila neutra (`stance=unknown`, `veto=False`,
+    `summary=classification_failed`) cuando un item falla, en vez de
+    dejarlo pendiente para siempre (head-of-line blocking del batch).
+  - **Bug #14 (scorecard)**: descarta puntos sin vela suficiente para el
+    horizonte (antes truncaba silenciosamente); upsert por
+    `(week, stance, horizon)` — constraint único nuevo, re-ejecutar el
+    job de la misma semana ya no duplica filas; itera TODOS los
+    `asset_tags` de un item, no solo el primero.
+  - **Bug #15 (notificaciones fantasma)**: `run_scan_cycle` evalúa cada
+    activo dentro de un `try/except` (un fallo en un activo ya no tumba
+    el resto del universo). `open_position`/`close_position`/
+    `update_open_positions`/`run_scan_cycle` ya no llaman a Telegram
+    directamente — devuelven el texto y el scheduler lo envía DESPUÉS de
+    `session.commit()`.
+  - **Bug #16 (veto pisa SL/TP)**: en `evaluate_exit`, el veto fundamental
+    ahora se comprueba DESPUÉS del bucle de velas (SL/TP/invalidación) —
+    antes pisaba una salida que ya había ocurrido en una vela anterior.
+  - **Bug #17 (pérdida diaria por tiempo de vela)**: columna nueva
+    `trade_exits.processed_at` (tiempo de PROCESO, monotónico, igual
+    criterio que el fix del bug #1 en la curva de equity);
+    `daily_loss_limit` y el resumen diario (`daily_summary.py`) agregan
+    por `processed_at`, nunca por `exit_time`.
+  - **Bug #18 (veto LLM sobre contenido no autenticado)**: nueva función
+    `asset_has_active_closing_veto` — el cierre FORZOSO de una posición
+    abierta exige `item_kind='news'` corroborado por
+    `FUNDAMENTAL_VETO_MIN_SOURCES` (2 por defecto) fuentes independientes
+    distintas; un veto de fuente `social` (Reddit) sigue bloqueando
+    ENTRADAS nuevas (sin cambios ahí) pero ya no puede cerrar una
+    posición por sí solo. Columnas nuevas `item_classifications.published_at`/
+    `source`; la ventana de decaimiento del veto (`FUNDAMENTAL_VETO_HOURS`)
+    se mide ahora desde `published_at` (con fallback a `classified_at`),
+    no desde `classified_at` — un backlog viejo clasificado tarde ya no
+    genera vetos "frescos" de noticias de hace días.
+
+  **Deuda operativa**: igual que con los bugs 1-4, cualquier histórico de
+  paper trading generado ANTES de este fix (bugs #10-#12 activos) debe
+  purgarse — el contador de los gates (≥60 días / ≥30 trades, sección 15)
+  se reinicia desde este commit. `backtests/RESULTS.md` necesita
+  recalcularse con el motor de fill corregido antes de usarse para
+  decidir nada.
+
 ## 2026-07-06
 
 - **[2026-07-06]** **Fase 3 (en progreso): meta-decider + dashboard +

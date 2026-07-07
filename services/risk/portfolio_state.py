@@ -22,10 +22,11 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
+from core.enums import TradeStatus
 from db.models import DecisionLog, EquitySnapshot, SystemState, TradeEntry, TradeExit
 
 # Environment del ledger interno de papel (fase 1, sin executor real).
@@ -48,6 +49,12 @@ class PortfolioSnapshot:
     system_halted_reason: str | None
     asset_cooldown_active: bool
     losses_cooldown_active: bool
+    # FIX (2026-07-07, bug #10 CODE_REVIEW_2026-07-07.md): ¿ya hay una
+    # entrada pendiente o abierta de papel en ESTE activo? Sin este check
+    # la misma vela de ruptura se re-detectaba en ciclos consecutivos
+    # (el scanner corre cada 15 min, las velas cambian cada 1h/4h) y abría
+    # posiciones duplicadas hasta chocar con max_positions/exposición.
+    asset_has_open_position: bool
     raw: dict[str, Any]
 
 
@@ -83,17 +90,38 @@ async def _get_open_positions(session: AsyncSession) -> tuple[int, Decimal]:
 
 
 async def _get_daily_realized_pnl_pct(session: AsyncSession, equity: Decimal, now: datetime) -> Decimal:
+    """FIX (2026-07-07, bug #17): agrega por `processed_at` (tiempo de
+    PROCESO del cierre, monotónico), nunca por `exit_time` (tiempo de la
+    vela). Un cierre procesado hoy con `exit_time` de ayer 23:40 debe
+    contar en la pérdida de HOY (cuando de verdad se descubrió/proceso),
+    igual que el fix del bug #1 en la curva de equity."""
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     stmt = (
         select(func.coalesce(func.sum(TradeExit.pnl_quote), Decimal("0")))
         .join(TradeEntry, TradeExit.trade_entry_id == TradeEntry.id)
-        .where(TradeEntry.environment == ENVIRONMENT, TradeExit.exit_time >= day_start)
+        .where(TradeEntry.environment == ENVIRONMENT, TradeExit.processed_at >= day_start)
     )
     result = await session.execute(stmt)
     pnl_quote = result.scalar_one()
     if equity <= 0:
         return Decimal("0")
     return pnl_quote / equity
+
+
+async def _asset_has_open_position(session: AsyncSession, asset: str) -> bool:
+    """FIX (2026-07-07, bug #10): `pending` cuenta como "ya comprometido"
+    en este activo (bloquea una segunda señal aunque todavía no haya
+    fill) igual que `open` — solo los estados cerrados/expirados liberan
+    el activo."""
+    stmt = select(
+        exists().where(
+            TradeEntry.environment == ENVIRONMENT,
+            TradeEntry.asset == asset,
+            TradeEntry.status.in_((TradeStatus.pending.value, TradeStatus.open.value)),
+        )
+    )
+    result = await session.execute(stmt)
+    return bool(result.scalar())
 
 
 async def _get_equity_peak(session: AsyncSession) -> Decimal | None:
@@ -191,6 +219,7 @@ async def build_portfolio_snapshot(
     state, halted_reason = await _get_system_state(session)
     asset_cooldown = await _asset_cooldown_active(session, asset, settings.cooldown_asset_hours, now)
     losses_cooldown = await _losses_cooldown_active(session, settings.cooldown_after_2sl_hours, now)
+    asset_has_open_position = await _asset_has_open_position(session, asset)
 
     return PortfolioSnapshot(
         equity_quote=equity,
@@ -203,6 +232,7 @@ async def build_portfolio_snapshot(
         system_halted_reason=halted_reason,
         asset_cooldown_active=asset_cooldown,
         losses_cooldown_active=losses_cooldown,
+        asset_has_open_position=asset_has_open_position,
         raw={
             "equity_quote": str(equity),
             "open_positions": open_positions,
