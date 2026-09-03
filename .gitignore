@@ -3,6 +3,8 @@ __pycache__/
 .venv/
 venv/
 .env
+.env.*
+!.env.example
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
@@ -11,4 +13,32 @@ uv.lock.tmp
 dist/
 build/
 .DS_Store
+Thumbs.db
 docker-compose.override.yml
+
+# Datos sensibles / secretos
+*.pem
+*.key
+*.p12
+*credentials*.json
+*token*.json
+secrets/
+
+# Bases de datos locales (Postgres corre en volumen Docker, no debe versionarse dump/backup)
+*.db
+*.sqlite
+*.sqlite3
+*.sql.gz
+*.dump
+
+# Logs
+*.log
+logs/
+
+# Config local del editor / Claude Code (permisos y settings específicos de esta máquina)
+.claude/settings.local.json
+.vscode/
+.idea/
+
+# Notebooks
+.ipynb_checkpoints/
