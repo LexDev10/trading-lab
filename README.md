@@ -93,8 +93,8 @@ Este proyecto se diseñó con principios claros:
 Clona el repositorio y crea tu archivo de configuración:
 
 ```bash
-git clone https://github.com/LexDev10/cripto--fable.git
-cd cripto--fable
+git clone https://github.com/LexDev10/trading-lab.git
+cd trading-lab
 cp .env.example .env
 ```
 
