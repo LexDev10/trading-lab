@@ -200,6 +200,24 @@ horizonte caiga después de la última vela disponible.)
   kill-switch" de `backtests/RESULTS.md` — el kill-switch parece cumplir
   su función en esta historia concreta, sin perjudicar el resultado
   medio (no generalizar como garantía para toda secuencia futura).
+- **Builds no reproducibles: no hay `uv.lock` en el repo.** El Dockerfile
+  hace `uv sync` sin lock, así que cada `docker build` (portátil hoy, VPS
+  mañana) resuelve versiones de nuevo dentro de los rangos de
+  `pyproject.toml`. Dos despliegues en fechas distintas pueden acabar con
+  dependencias distintas sin que nada lo avise, y un build que empieza a
+  fallar "sin tocar nada" casi siempre es esto. Generar `uv lock`,
+  commitearlo y pasar el Dockerfile a `uv sync --frozen` cierra el
+  agujero — obligatorio antes de congelar código para los ≥60 días de los
+  gates, o el histórico no se habrá generado con un stack estable.
+- **Despliegue en VPS**: `docs/DEPLOY_VPS.md` + `docker-compose.prod.yml`.
+  El override de producción NO es opcional en un servidor: el compose
+  base publica puertos pensando en una máquina local, y ni la API ni el
+  dashboard Streamlit tienen autenticación (la pestaña "Analizar" ejecuta
+  trabajo real). El merge de `ports` en Compose es aditivo — por eso el
+  override usa `ports: !override`; quitar el tag reabre el puerto público
+  en silencio. Los contenedores corren como root y no hay alerta de
+  caída: si el stack muere, el síntoma es que deja de llegar el informe
+  diario.
 - `scripts/check_live_gates.py` no existe todavía (sección 15 lo exige).
 - Executor OCO real + reconciliación contra testnet: sin construir
   (bloqueado por credenciales). Los criterios de aceptación de Fase 1

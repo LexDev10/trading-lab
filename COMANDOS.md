@@ -9,7 +9,7 @@ negocio y bugs ya corregidos ver [CLAUDE.md](CLAUDE.md).
 
 ```bash
 cp .env.example .env                  # solo la primera vez
-docker compose up -d --build          # levanta postgres + app + dashboard
+docker compose up -d --build          # levanta postgres + app + dashboard (LOCAL)
 docker compose ps                     # ver estado de los contenedores
 docker compose logs -f app            # logs en vivo del scheduler/API
 docker compose down                   # parar todo (mantiene el volumen de postgres)
@@ -27,6 +27,14 @@ Verificar que la app responde:
 
 ```bash
 curl http://localhost:8000/health
+```
+
+En un **VPS** hay que añadir siempre el override de producción (cierra
+puertos, rota logs, monta `reports/`) — ver
+[docs/DEPLOY_VPS.md](docs/DEPLOY_VPS.md):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 ```
 
 ## Analizar un activo (equivalente a `/analiza`)
@@ -64,6 +72,22 @@ cerradas (win rate, PnL, profit factor).
 # HTML minimalista — solo lectura, sin selector de activo
 # http://localhost:8000/dashboard
 ```
+
+## Informe diario
+
+Se envía solo por Telegram a la hora local configurada
+(`DAILY_REPORT_HOUR` en `REPORT_TIMEZONE`, por defecto 22:00
+Europe/Madrid) y deja copia en `REPORTS_DIR/informe-YYYY-MM-DD.md`.
+Para generarlo a mano sin esperar al cron:
+
+```bash
+docker compose exec app uv run python -m scripts.informe            # imprime y guarda
+docker compose exec app uv run python -m scripts.informe --enviar   # además notifica por Telegram
+docker compose exec app uv run python -m scripts.informe --no-guardar
+```
+
+La ventana que agrega el informe es el día UTC (la misma que el
+`daily_loss_limit` del risk engine), aunque el envío sea a hora local.
 
 ## Halt / rearme del killswitch
 
@@ -109,6 +133,19 @@ docker compose exec app uv run alembic revision --autogenerate -m "mensaje"
 docker compose exec app uv run alembic upgrade head
 docker compose exec app uv run alembic current      # ver revisión actual
 docker compose exec app uv run alembic history       # ver historial
+```
+
+## Backups (VPS)
+
+```bash
+./deploy/backup_db.sh                 # dump comprimido en ./backups
+RETENTION_DAYS=30 ./deploy/backup_db.sh /var/backups/trading-lab
+```
+
+Restaurar:
+
+```bash
+gunzip -c backups/trading_lab-YYYYMMDD-HHMMSS.sql.gz | docker compose exec -T postgres psql -U trading -d trading_lab
 ```
 
 ## Base de datos (acceso directo)

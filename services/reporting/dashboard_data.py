@@ -15,9 +15,30 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from db.models import DecisionLog, EquitySnapshot, ItemClassification, SystemState, TradeEntry, TradeExit
+from db.models import (
+    Candle,
+    DecisionLog,
+    EquitySnapshot,
+    ItemClassification,
+    SystemState,
+    TradeEntry,
+    TradeExit,
+)
 from services.fundamental.veto import asset_has_active_veto
 from services.risk.portfolio_state import ENVIRONMENT
+
+
+# Umbral de frescura de datos (seccion 8.2): 2x el timeframe de 1h.
+# Fuente unica — la usan `/health` y el informe diario.
+STALE_AFTER_HOURS = 2
+
+
+async def get_latest_candle_time(session: AsyncSession) -> datetime | None:
+    """`open_time` de la vela mas reciente persistida, de cualquier
+    activo/timeframe — frescura de datos (seccion 8.2). Fuente unica para
+    `/health` y para el informe diario; no se reimplementa en ninguno."""
+    result = await session.execute(select(func.max(Candle.open_time)))
+    return result.scalar_one_or_none()
 
 
 async def count_open_positions(session: AsyncSession) -> int:
@@ -108,9 +129,19 @@ class ClosedTradeRow:
     pnl_pct_net: Decimal
 
 
-async def get_closed_trades_history(session: AsyncSession, limit: int = 50) -> list[ClosedTradeRow]:
+async def get_closed_trades_history(
+    session: AsyncSession, limit: int = 50, since_processed_at: datetime | None = None
+) -> list[ClosedTradeRow]:
     """Historial fila-a-fila (no el agregado de `compute_closed_trades_summary`)
-    para la tabla de trades del dashboard."""
+    para la tabla de trades del dashboard.
+
+    `since_processed_at` acota a los cierres PROCESADOS desde ese instante
+    (informe diario) y ordena por `processed_at` — mismo criterio que
+    `daily_summary._trades_today` y `portfolio_state._get_daily_realized_pnl_pct`:
+    nunca `exit_time`, que es tiempo de vela y puede quedar horas en el
+    pasado (bug #17, CLAUDE.md). Sin el parametro, el comportamiento es el
+    de siempre (ultimos cierres por `exit_time`).
+    """
     stmt = (
         select(
             TradeEntry.asset, TradeEntry.entry_time, TradeEntry.entry_price,
@@ -119,9 +150,13 @@ async def get_closed_trades_history(session: AsyncSession, limit: int = 50) -> l
         )
         .join(TradeEntry, TradeExit.trade_entry_id == TradeEntry.id)
         .where(TradeEntry.environment == ENVIRONMENT)
-        .order_by(TradeExit.exit_time.desc())
         .limit(limit)
     )
+    if since_processed_at is None:
+        stmt = stmt.order_by(TradeExit.exit_time.desc())
+    else:
+        stmt = stmt.where(TradeExit.processed_at >= since_processed_at).order_by(TradeExit.processed_at.desc())
+
     result = await session.execute(stmt)
     return [
         ClosedTradeRow(

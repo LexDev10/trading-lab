@@ -3,6 +3,83 @@
 Registro cronológico de lo implementado en el proyecto. Formato:
 `[YYYY-MM-DD HH:MM] Descripción`.
 
+## 2026-09-04
+
+- **[2026-09-04]** **Despliegue en VPS + informe diario enriquecido.**
+  Sin migraciones (ningún cambio de esquema). **Pendiente de verificar en
+  Docker** — ver nota al final de la entrada.
+
+  - **Endurecimiento para servidor**: `docker-compose.prod.yml` nuevo
+    (override que se aplica encima del base). Cierra la API (8000) y el
+    dashboard (8501) a `127.0.0.1` con `ports: !override` — el merge de
+    `ports` en Compose es ADITIVO, así que sin el tag el `0.0.0.0:8000`
+    del base seguiría publicado y el endurecimiento sería cosmético.
+    Añade rotación de logs (`max-size`, el driver json-file crece sin
+    límite y llena el disco del VPS), healthcheck de `app` contra
+    `/health`, y el volumen `./reports`. En el compose **base**, Postgres
+    pasa de `5432:5432` a `127.0.0.1:5432:5432`: publicado en la IP
+    pública de un VPS con la contraseña de ejemplo, era la base de datos
+    abierta a Internet.
+  - **`docs/DEPLOY_VPS.md`** nuevo: requisitos de máquina (2 GB de RAM
+    como mínimo real por `vectorbt`/`pandas`), preparación del servidor,
+    `.env` en el VPS, túnel SSH para el dashboard (no se publica: no
+    tiene login), backups, actualizaciones y checklist de verificación.
+  - **`deploy/backup_db.sh`** nuevo: `pg_dump` comprimido con retención.
+    Fail-closed — descarta un dump vacío o sospechosamente pequeño en vez
+    de dejar un backup inservible que dé falsa seguridad. El histórico de
+    paper trading es lo único que puede desbloquear los gates de capital
+    real (sección 15) y vive en un volumen Docker sin copia.
+  - **Hora del informe configurable**: `REPORT_TIMEZONE` (por defecto
+    `Europe/Madrid`), `DAILY_REPORT_HOUR`, `DAILY_REPORT_MINUTE` y
+    `REPORTS_DIR` en `app/config.py` + `.env.example`. El cron de
+    APScheduler usa `Settings.report_tzinfo` (fail-open a UTC si la zona
+    está mal escrita: el informe es notificación, no una decisión de
+    trading). **DECISION**: la VENTANA que agrega el informe sigue siendo
+    el día UTC aunque el envío sea local — tiene que coincidir con la del
+    `daily_loss_limit` (bug #17), o el informe y el freno de riesgo
+    contarían días distintos. Dependencia nueva `tzdata`: `python:3.12-slim`
+    no garantiza `/usr/share/zoneinfo` y sin ella `zoneinfo` caería a UTC
+    dentro del contenedor.
+  - **Troceo de mensajes de Telegram** (`notifications/telegram.py::split_message`):
+    `sendMessage` corta en 4096 caracteres. El informe enriquecido puede
+    superarlos y, siendo el envío fail-open, el 400 solo se logueaba: el
+    informe del día se perdía entero y en silencio. Se trocea por líneas
+    completas (no parte etiquetas HTML de `parse_mode`) con sufijo
+    `(n/total)`.
+  - **Informe diario enriquecido** (`services/reporting/daily_summary.py`):
+    añade estado del sistema con motivo del halt, frescura de la última
+    vela, límites de riesgo vigentes, detalle trade a trade de los cierres
+    del día, órdenes registradas y cuántas expiraron sin fill (embudo del
+    bug #11), posiciones abiertas/pendientes con PnL no realizado, vetos
+    fundamentales activos y el acumulado histórico (win rate, expectancy,
+    profit factor). Todo reutilizando `dashboard_data` — ninguna consulta
+    ni fórmula duplicada (regla sección 6). El PnL no realizado usa el
+    último cierre 1h YA CERRADO, filtrando explícitamente la kline en
+    formación (bug #2). Copia en disco con `save_report`, fail-open y
+    escrita ANTES de notificar, para que un Telegram caído no se lleve por
+    delante el informe del día.
+  - **`get_latest_candle_time` + `STALE_AFTER_HOURS`** movidos a
+    `dashboard_data`: `/health` y el informe compartían el criterio de
+    frescura en dos sitios; ahora es uno.
+  - **`get_closed_trades_history`** acepta `since_processed_at` opcional
+    (ordena por `processed_at`) — mismo criterio de "hoy" que
+    `_trades_today` y `_get_daily_realized_pnl_pct`, nunca `exit_time`.
+  - **`scripts/informe.py`** nuevo: genera el informe bajo demanda.
+    **DECISION**: por defecto NO envía a Telegram (un comando manual no
+    debe meter ruido en el canal); el envío es opt-in con `--enviar`.
+  - Tests nuevos: `tests/unit/test_daily_report_scheduling.py` (troceo,
+    zona horaria, próximo disparo, copia en disco).
+  - Docs: `README.md` (sección de despliegue e informe diario) y
+    `COMANDOS.md` (informe, compose de producción, backups).
+
+  **Verificación pendiente**: el daemon de Docker no estaba disponible al
+  hacer estos cambios, así que `pytest` y `mypy` NO se han ejecutado
+  contra el contenedor. Antes de fiarse de esta entrada hay que correr,
+  con el stack levantado:
+  `docker compose up -d --build app` → `docker compose exec app uv run pytest -q`
+  → `docker compose exec app uv run pytest tests/integration -q` →
+  `docker compose run --rm --no-deps app uv run mypy`.
+
 ## 2026-07-07
 
 - **[2026-07-07]** **Corrección de los bugs #10-#18 de

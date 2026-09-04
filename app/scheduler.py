@@ -9,7 +9,9 @@ dominio de fallo:
   (sección 12.3) sobre los items del PIT sin clasificar todavía.
 - `classifier_scorecard_job`, cron semanal (lunes 00:05 UTC): evalúa el
   clasificador contra retornos realizados (sección 12.3/16).
-- `daily_summary_job`, cron 22:00 UTC: resumen diario por Telegram
+- `daily_summary_job`, cron diario a la hora local configurada
+  (`DAILY_REPORT_HOUR` en `REPORT_TIMEZONE`, por defecto 22:00
+  Europe/Madrid): informe diario por Telegram + copia en disco
   (sección 17)."""
 
 import asyncio
@@ -27,7 +29,7 @@ from services.execution.paper_ledger import update_open_positions
 from services.fundamental import ingest_reddit, ingest_rss
 from services.fundamental.classify import classify_pending_items
 from services.fundamental.scorecard import compute_weekly_scorecard
-from services.reporting.daily_summary import build_daily_summary
+from services.reporting.daily_summary import build_daily_summary, next_report_run, save_report
 from services.scanner.scanner import run_scan_cycle
 
 logger = get_logger("scheduler")
@@ -155,13 +157,22 @@ async def classifier_scorecard_job() -> None:
 
 
 async def daily_summary_job() -> None:
-    """Resumen diario por Telegram a las 22:00 UTC (sección 17)."""
+    """Informe diario por Telegram (sección 17) a la hora local
+    configurada (`DAILY_REPORT_HOUR`/`DAILY_REPORT_MINUTE` en
+    `REPORT_TIMEZONE`), con copia en disco en `REPORTS_DIR`.
+
+    La ventana que agrega el informe sigue siendo el día UTC — ver la
+    DECISION de `services/reporting/daily_summary.py`."""
     settings = get_settings()
     now = datetime.now(tz=UTC)
     try:
         async with get_session() as session:
             text = await build_daily_summary(session, settings, now)
+        # El fichero se escribe ANTES de notificar: si Telegram está caído
+        # (fail-open, no lanza), el informe del día no se pierde.
+        path = save_report(text, settings, now)
         await send_message(settings, text)
+        logger.info("daily_report.sent", report_path=str(path) if path else None)
     except Exception:
         logger.exception("daily_summary.failed")
 
@@ -245,9 +256,9 @@ def start_scheduler() -> AsyncIOScheduler:
     scheduler.add_job(
         daily_summary_job,
         trigger="cron",
-        hour=22,
-        minute=0,
-        timezone=UTC,
+        hour=settings.daily_report_hour,
+        minute=settings.daily_report_minute,
+        timezone=settings.report_tzinfo,
         id="daily_summary",
         max_instances=1,
         coalesce=True,
@@ -264,5 +275,10 @@ def start_scheduler() -> AsyncIOScheduler:
         coalesce=True,
     )
     scheduler.start()
-    logger.info("scheduler.started", interval_minutes=settings.scan_interval_minutes)
+    logger.info(
+        "scheduler.started",
+        interval_minutes=settings.scan_interval_minutes,
+        daily_report_at=f"{settings.daily_report_hour:02d}:{settings.daily_report_minute:02d} {settings.report_timezone}",
+        daily_report_next_utc=next_report_run(settings, datetime.now(tz=UTC)).isoformat(),
+    )
     return scheduler

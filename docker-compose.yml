@@ -7,7 +7,10 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trading}
       POSTGRES_DB: ${POSTGRES_DB:-trading_lab}
     ports:
-      - "5432:5432"
+      # Solo loopback: la DB nunca debe escuchar en una IP publica (en el
+      # VPS eso seria exponerla a Internet con la password por defecto).
+      # Desde el host se sigue llegando por localhost:5432 igual que antes.
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:

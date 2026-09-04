@@ -4,6 +4,7 @@ viven aquí con sus defaults; nada se hardcodea en los servicios."""
 from decimal import Decimal
 from functools import lru_cache
 from typing import Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -43,6 +44,23 @@ class Settings(BaseSettings):
     cooldown_after_2sl_hours: int = 24
     min_rr_net: Decimal = Decimal("1.8")
     taker_fee: Decimal = Decimal("0.001")
+
+    # --- Informes / notificaciones (sección 17) ---
+    # DECISION (2026-09-04): la hora de ENVÍO del informe diario es
+    # configurable y se interpreta en `report_timezone` (por defecto
+    # Europe/Madrid, la del usuario) para que llegue a una hora legible.
+    # La VENTANA que agrega el informe sigue siendo el día UTC — igual
+    # que `portfolio_state._get_daily_realized_pnl_pct` (bug #17,
+    # CLAUDE.md): el resumen diario y el `daily_loss_limit` deben
+    # coincidir en qué cuenta como "hoy". Cambiar la ventana a hora local
+    # desalinearía el informe del freno de riesgo.
+    report_timezone: str = "Europe/Madrid"
+    daily_report_hour: int = 22
+    daily_report_minute: int = 0
+    # Copia en disco de cada informe (Markdown, un fichero por día). En
+    # el VPS se monta como volumen para poder recuperarlos por scp.
+    # Vacío = no escribir nada a disco (solo Telegram).
+    reports_dir: str = "reports"
 
     # --- Ejecución ---
     entry_ttl_minutes: int = 45
@@ -102,6 +120,16 @@ class Settings(BaseSettings):
     # --- Binance ---
     binance_api_key: str = ""
     binance_api_secret: str = ""
+
+    @property
+    def report_tzinfo(self) -> ZoneInfo:
+        """`ZoneInfo` de `report_timezone`. Fail-open a UTC: una zona mal
+        escrita en `.env` no debe impedir que arranque el scheduler (el
+        informe es notificación, no una decisión de trading)."""
+        try:
+            return ZoneInfo(self.report_timezone)
+        except ZoneInfoNotFoundError:
+            return ZoneInfo("UTC")
 
     @property
     def universe_list(self) -> list[str]:

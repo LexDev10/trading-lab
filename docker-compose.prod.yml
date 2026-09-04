@@ -1,0 +1,63 @@
+# Override de PRODUCCIÓN (VPS). Uso:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# Qué cambia respecto a `docker-compose.yml` (pensado para Docker Desktop
+# en una máquina local, detrás de un router):
+#
+# 1. La API (8000) y el dashboard Streamlit (8501) se publican SOLO en
+#    127.0.0.1 del VPS. Ninguno de los dos tiene autenticación: expuestos
+#    en la IP pública, cualquiera vería la cartera y podría lanzar
+#    análisis desde la pestaña "Analizar". Se llegan por túnel SSH desde
+#    el portátil (ver docs/DEPLOY_VPS.md).
+#    (Postgres ya no publica puerto público: se acotó a 127.0.0.1 en el
+#    compose base, porque exponerlo con la contraseña por defecto en un
+#    VPS es dejar la base de datos abierta a Internet.)
+# 2. Rotación de logs: sin `max-size`, el driver json-file crece sin
+#    límite hasta llenar el disco del VPS (el scheduler loguea cada 15
+#    minutos, indefinidamente).
+# 3. Healthcheck del servicio `app`, para que `docker compose ps` diga si
+#    el sistema está realmente vivo y no solo si el proceso existe.
+# 4. Volumen de informes: `./reports` del host, para recuperar los .md
+#    diarios por scp sin entrar al contenedor.
+#
+# No desactiva `host.docker.internal`: si no hay Ollama en el VPS, el job
+# de clasificación avisa `classify.model_not_available` y no hace nada
+# (con MODE=technical_only ni se necesita).
+
+services:
+  postgres:
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  app:
+    # `!override` (Compose >= 2.24) porque el merge de `ports` es ADITIVO:
+    # sin el tag, el "8000:8000" del compose base seguiria publicado en 0.0.0.0
+    # ademas del bind a loopback, y el endurecimiento no serviria de nada.
+    ports: !override
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./reports:/app/reports
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  dashboard:
+    ports: !override
+      - "127.0.0.1:8501:8501"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

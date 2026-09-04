@@ -21,6 +21,10 @@ dependencies = [
     "httpx>=0.27,<1.0",  # alertas Telegram + descarga RSS/JSON fundamental (fase 2), async, encaja con el resto del stack
     "feedparser>=6.0,<7.0",  # parseo de RSS estándar (CoinDesk, The Block) para el almacén PIT (sección 12.2)
     "streamlit>=1.40,<2.0",  # dashboard de solo lectura (fase 3) — servicio nuevo en docker-compose, no toca FastAPI/app
+    # zoneinfo necesita la base de datos de zonas horarias; python:3.12-slim (Debian slim)
+    # no la trae garantizada. Sin esto, REPORT_TIMEZONE=Europe/Madrid caeria a UTC dentro
+    # del contenedor y el informe diario se enviaria a la hora equivocada.
+    "tzdata>=2024.1",
 ]
 
 [dependency-groups]

@@ -42,3 +42,7 @@ logs/
 
 # Notebooks
 .ipynb_checkpoints/
+
+# Informes diarios generados y backups de la DB (datos de operativa, no codigo)
+reports/
+backups/

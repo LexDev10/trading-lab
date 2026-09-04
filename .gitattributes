@@ -1,0 +1,8 @@
+# Normalizacion de finales de linea. Sin esto, git en Windows entrega los
+# .sh con CRLF y en el VPS fallan con "bad interpreter: /usr/bin/env bash^M".
+* text=auto eol=lf
+
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

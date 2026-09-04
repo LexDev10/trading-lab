@@ -12,8 +12,9 @@ from app.dashboard import render_dashboard
 from app.scheduler import start_scheduler
 from core.git_info import get_git_sha
 from core.logging import configure_logging, get_logger
-from db.models import Candle, SystemState
+from db.models import SystemState
 from db.session import get_session
+from services.reporting.dashboard_data import STALE_AFTER_HOURS, get_latest_candle_time
 
 logger = get_logger("app")
 
@@ -39,8 +40,7 @@ async def health() -> dict:
     system_state = "running"
     try:
         async with get_session() as session:
-            result = await session.execute(select(Candle.open_time).order_by(Candle.open_time.desc()).limit(1))
-            latest_candle_at = result.scalar_one_or_none()
+            latest_candle_at = await get_latest_candle_time(session)
             state_row = await session.execute(select(SystemState.state).where(SystemState.id == 1))
             state_value = state_row.scalar_one_or_none()
             if state_value is not None:
@@ -51,7 +51,7 @@ async def health() -> dict:
     stale = True
     if latest_candle_at is not None:
         age_hours = (datetime.now(tz=UTC) - latest_candle_at).total_seconds() / 3600
-        stale = age_hours > 2  # 2x timeframe de 1h, ver sección 8.2
+        stale = age_hours > STALE_AFTER_HOURS  # 2x timeframe de 1h, ver sección 8.2
 
     return {
         "status": "ok" if db_ok else "degraded",
